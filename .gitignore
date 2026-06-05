@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+*.tmp
+# test-loop itself does not produce run output yet; once scripts/ land,
+# this section will mirror what caff uses.
+docs/reports/
