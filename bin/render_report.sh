@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# render_report.sh — run swift test and produce docs/reports/<date>.md
+# render_report.sh — run the project's test command and produce
+# docs/reports/<date>/{log.txt, summary.json, report.md}.
 #
 # Usage:
-#   scripts/render_report.sh           # run tests and write today's report
-#   scripts/render_report.sh --collect # only render from an existing log
+#   bin/render_report.sh                                  # caff defaults (swift test --parallel)
+#   bin/render_report.sh --language python                # pytest (no extra args)
+#   bin/render_report.sh --test-command "go test ./..."   # explicit command
+#   bin/render_report.sh --collect                        # only render from an existing log
 #
-# Output:
-#   docs/reports/<YYYY-MM-DD>/log.txt
-#   docs/reports/<YYYY-MM-DD>/summary.json
-#   docs/reports/<YYYY-MM-DD>/report.md
+# Supported languages: swift (default), python, go, rust.
+# --test-command overrides the per-language default test invocation.
 
 set -euo pipefail
 
@@ -25,18 +26,83 @@ REPORT_FILE="$REPORT_DIR/report.md"
 
 mkdir -p "$REPORT_DIR"
 
+LANGUAGE="swift"
 COLLECT_ONLY=0
-for arg in "$@"; do
+TEST_COMMAND=""
+while [ $# -gt 0 ]; do
+    arg="$1"
     case "$arg" in
-        --collect) COLLECT_ONLY=1 ;;
+        --collect)       COLLECT_ONLY=1; shift ;;
+        --language)      LANGUAGE="${2:-}"; shift 2 ;;
+        --language=*)    LANGUAGE="${arg#--language=}"; shift ;;
+        --test-command)  TEST_COMMAND="${2:-}"; shift 2 ;;
+        --test-command=*) TEST_COMMAND="${arg#--test-command=}"; shift ;;
+        -h|--help)
+            sed -n '3,16p' "$0"; exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
+# Per-language defaults. --test-command overrides.
+if [[ -z "$TEST_COMMAND" ]]; then
+    case "$LANGUAGE" in
+        swift)  TEST_COMMAND="swift test --parallel" ;;
+        python) TEST_COMMAND="python -m pytest -q" ;;
+        go)     TEST_COMMAND="go test ./..." ;;
+        rust)   TEST_COMMAND="cargo test --no-fail-fast" ;;
+        *) echo "unsupported --language: $LANGUAGE" >&2; exit 2 ;;
+    esac
+fi
+
+# Per-language log parsing patterns.
+case "$LANGUAGE" in
+    swift)
+        # ✔ Test foo() passed after 0.001 seconds.
+        # ✘ Test bar() failed after 0.002 seconds with 1 issue.
+        TEST_LINE_RX='^(✔|✘) Test [^()]+\('
+        PASS_LINE_RX='^✔ Test '
+        FAIL_LINE_RX='^✘ Test '
+        FAIL_NAME_RX='^✘ Test ([^(]+).*'
+        RUN_LINE_RX='Test run with .* tests? '
+        ;;
+    python)
+        # pytest short summary lines are "FAILED test_module.py::test_name".
+        # The full per-test lines are "test_module.py F" etc. We treat each
+        # FAILED summary line as one failing test (and let classify handle
+        # dedup).
+        TEST_LINE_RX='^(FAILED|PASSED) '
+        PASS_LINE_RX='^PASSED '
+        FAIL_LINE_RX='^FAILED '
+        FAIL_NAME_RX='^FAILED [^:]+::(.+)$'
+        RUN_LINE_RX='[0-9]+ (passed|failed) in '
+        ;;
+    go)
+        # go test verbose:
+        #   --- FAIL: TestFoo (0.00s)
+        #   --- PASS: TestFoo (0.00s)
+        TEST_LINE_RX='^--- (PASS|FAIL): '
+        PASS_LINE_RX='^--- PASS: '
+        FAIL_LINE_RX='^--- FAIL: '
+        FAIL_NAME_RX='^--- FAIL: ([^ ]+).*'
+        RUN_LINE_RX='^(ok|FAIL)[[:space:]]'
+        ;;
+    rust)
+        # cargo test per-test:
+        #   test test_foo ... ok
+        #   test test_foo ... FAILED
+        TEST_LINE_RX='^test[[:space:]]+\S+[[:space:]]+\.\.\. '
+        PASS_LINE_RX='^test[[:space:]]+\S+[[:space:]]+\.\.\. ok'
+        FAIL_LINE_RX='^test[[:space:]]+\S+[[:space:]]+\.\.\. FAILED'
+        FAIL_NAME_RX='^test[[:space:]]+(\S+)[[:space:]]+\.\.\. FAILED'
+        RUN_LINE_RX='test result: (ok|FAILED)\.'
+        ;;
+    *) echo "unsupported --language: $LANGUAGE" >&2; exit 2 ;;
+esac
+
 if [[ $COLLECT_ONLY -eq 0 ]]; then
-    echo "running: swift test --parallel" >&2
+    echo "running: $TEST_COMMAND" >&2
     set +e
-    swift test --parallel 2>&1 | tee "$LOG_FILE"
+    eval "$TEST_COMMAND" 2>&1 | tee "$LOG_FILE"
     SWIFT_EXIT=${PIPESTATUS[0]}
     set -e
 else
@@ -47,19 +113,15 @@ else
     SWIFT_EXIT=0
 fi
 
-# Parse log into a summary. Log format from swift test is lines like:
-#   ✔ Test foo() passed after 0.001 seconds.
-#   ✘ Test bar() failed after 0.002 seconds with 1 issue.
-#   ✘ Test baz() recorded an issue at Path.swift:10:5: ...
-TOTAL=$(grep -cE '^(✔|✘) Test [^()]+\(' "$LOG_FILE" || true)
-PASSED=$(grep -cE '^✔ Test [^()]+\(' "$LOG_FILE" || true)
-FAILED=$(grep -cE '^✘ Test [^()]+\(' "$LOG_FILE" || true)
+TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
+PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
+FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
 
 # Pull out the failing test names for the report. macOS ships bash 3.2 (no mapfile),
 # so use a temp file and a here-string read loop.
 FAILING_TESTS_TMP="$(mktemp)"
 trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
-grep -E '^✘ Test ' "$LOG_FILE" | sed -E 's/^✘ Test ([^(]+).*/\1/' > "$FAILING_TESTS_TMP" || true
+grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
 FAILING_TESTS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && FAILING_TESTS+=("$line")
