@@ -54,6 +54,94 @@ and generic agents (`.agents/`):
 | `report-render` | turn a test log into a Markdown + JSON report |
 | `drill` | inject one failing test, verify the loop reacts, roll back |
 
+## Why test-loop and not X
+
+A short positioning note for the most likely alternatives.
+
+**`test-loop` vs. `aitest-kit`.** aitest-kit is a deeper, Python-specific
+toolchain that *compiles* Markdown test designs into pytest code. If your
+project is Python and you want AI-generated test code from prose, use
+aitest-kit. If your project is in Swift, Go, Rust, TypeScript, or any
+other language and you want a thin loop around whatever test runner
+you already have, use test-loop. They do not overlap.
+
+**`test-loop` vs. a linter (ESLint, RuboCop, swift-format, …).** A linter
+checks one file at a time against a static rule. test-loop is a loop
+across at least five moving parts: source, tests, the test runner, the
+report, and CI. A linter would not have caught the
+[2026-06-02 caff drill](https://github.com/majiayu000/caff) regression,
+where the failure classifier was double-counting tests. test-loop did.
+
+**`test-loop` vs. a coverage tool (codecov, llvm-cov, …).** Coverage
+answers "which lines are exercised?" It does not answer "did the test
+that is supposed to verify this contract actually run?" `drill` is the
+test-loop tool that answers the second question.
+
+**`test-loop` vs. hand-rolled `scripts/` in one project.** Every
+mid-size repo eventually grows a `scripts/` directory with
+`check_drift.sh`, `classify_failures.py`, `render_report.sh`, and a
+pre-commit hook that calls the first one. test-loop is the version of
+that pattern that you copy once and reuse, with the five pieces
+kept in lock-step across Claude Code, Codex, and generic agents.
+
+**`test-loop` vs. a test framework (Swift Testing, pytest, go test, …).**
+test-loop does not run tests; it sits around the test runner and
+inspects its inputs and outputs. Use the framework for the test, use
+test-loop for the loop.
+
+## Roadmap
+
+test-loop is shipped in three increments. The current release is the
+first.
+
+### v0.1 — contract (this release)
+
+- Six skills, each with a self-contained `SKILL.md` describing inputs,
+  outputs, algorithms, and worked examples.
+- Three copy destinations (`.claude/`, `.codex/`, `.agents/`) kept in
+  sync from a single agent-neutral source by `scripts/sync_skills.py`.
+- A project-level L0 in `docs/knowledge/L0_overview.md` describing the
+  loop, the failure-class taxonomy, and the boundaries of the project.
+- An MIT-licensed GitHub repository with a default-branch `main` and
+  no CI yet (intentional: the loop is what installs the CI; you cannot
+  eat your own dog food before the food is in the bowl).
+
+What v0.1 cannot do: it cannot *run* the loop. The skills describe
+contracts; the scripts that fulfil them arrive in v0.2.
+
+### v0.2 — scripts
+
+- Import the five scripts that already shipped in [caff 0.1.4](https://github.com/majiayu000/caff):
+  `check_drift.sh`, `classify_failures.py`, `render_report.sh`,
+  `.githooks/pre-commit`, `.github/workflows/test.yml`.
+- Add `--language` parameters so the scripts work on Swift, Python, Go,
+  and Rust. The caff versions are Swift-only; test-loop versions are
+  cross-language.
+- Self-test each script. `classify_failures.py` already has ten
+  internal unit tests; the others get similar treatment.
+- Run a real `drill` on the test-loop repository itself, with the
+  evidence in `docs/knowledge/drill-2026-06-XX.md`.
+- Add a `.github/workflows/test.yml` so the loop is dog-fooded.
+
+### v0.3 — adoption
+
+- Point [caff](https://github.com/majiayu000/caff)'s own `scripts/` at
+  test-loop's copy, so caff 0.2.0 pulls rather than re-implementing.
+  (Optional; caff is the reference project but does not have to be a
+  consumer.)
+- Add a Homebrew formula, so macOS users can `brew install test-loop`
+  and get the loop as a system tool.
+- Add an `examples/` directory with one minimal project per supported
+  language, each one running its own drill on every commit.
+
+### Out of scope (any version)
+
+- Per-language pattern libraries beyond Swift in v0.2.
+- A pluggable plugin system. The five tools are deliberately the five
+  tools; adding a sixth needs a separate spec.
+- A web UI for the report. The Markdown report is the report.
+- An AI auto-fixer. The loop surfaces what is wrong; the user decides.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
