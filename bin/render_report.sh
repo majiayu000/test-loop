@@ -128,16 +128,26 @@ while IFS= read -r line; do
 done < "$FAILING_TESTS_TMP"
 
 # Classify failing tests by naming convention. Output is a small JSON file
-# that we then merge into summary.json. See scripts/classify_failures.py.
+# that we then merge into summary.json. classify_failures.py is a sibling of
+# this script, so $SCRIPT_DIR resolves it whether installed under bin/ or
+# scripts/.
 CLASSIFY_FILE="$REPORT_DIR/classify.json"
-python3 "$REPO_ROOT/scripts/classify_failures.py" --in "$LOG_FILE" --out "$CLASSIFY_FILE" \
-    >/dev/null 2>&1 || echo '{}' > "$CLASSIFY_FILE"
+CLASSIFY_ERR="$REPORT_DIR/classify.err"
+if python3 "$SCRIPT_DIR/classify_failures.py" --language "$LANGUAGE" --in "$LOG_FILE" --out "$CLASSIFY_FILE" 2>"$CLASSIFY_ERR"; then
+    rm -f "$CLASSIFY_ERR"
+else
+    # Do not hide the failure behind an empty {} (no silent degradation):
+    # surface the error and flag the classification as degraded.
+    echo "error: classify_failures.py failed; see $CLASSIFY_ERR" >&2
+    cat "$CLASSIFY_ERR" >&2 || true
+    echo '{"failures": [], "failures_by_class": {}, "failures_grouped": {}, "classify_error": true}' > "$CLASSIFY_FILE"
+fi
 
 # Try to extract the run-summary line. swift test may print it as either
 #   "Test run with 74 tests passed after 0.005 seconds."
 # or, when stderr is interleaved,
 #   "✔ Test run with 74 tests passed after 0.005 seconds."
-RUN_LINE=$(grep -E 'Test run with .* tests? ' "$LOG_FILE" | tail -1 | sed -E 's/^[✔✘] //' || true)
+RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | tail -1 | sed -E 's/^[✔✘] //' || true)
 [[ -z "$RUN_LINE" ]] && RUN_LINE="(no summary line found)"
 
 # Write a small JSON summary. Use python3 for safe JSON encoding.
@@ -158,9 +168,12 @@ with open(summary_path, "w", encoding="utf-8") as f:
             cls = json.load(cf)
         body["failures_by_class"] = cls.get("failures_by_class", {})
         body["failures_grouped"] = cls.get("failures_grouped", {})
+        if cls.get("classify_error"):
+            body["classify_error"] = True
     except (OSError, ValueError):
         body["failures_by_class"] = {}
         body["failures_grouped"] = {}
+        body["classify_error"] = True
     json.dump(body, f, indent=2, ensure_ascii=False)
 ' "$SUMMARY_FILE" "$CLASSIFY_FILE" "$TOTAL" "$PASSED" "$FAILED" "$SWIFT_EXIT" "$RUN_LINE"
 
