@@ -26,16 +26,16 @@ jobs:
         run: swift build
 
       - name: Render test report
-        run: bash scripts/render_report.sh
+        run: bash bin/render_report.sh
 
       - name: Check L1 drift
-        run: bash scripts/check_drift.sh
+        run: bash bin/check_drift.sh
 
       - name: Upload test report artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: caff-test-report
+          name: test-loop-report
           path: docs/reports/
           retention-days: 14
           if-no-files-found: warn

@@ -1,0 +1,25 @@
+name: self-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Syntax check shell scripts
+        run: bash -n bin/check_drift.sh bin/render_report.sh templates/githooks/pre-commit
+      - name: Failure classifier self-test
+        run: python3 bin/classify_failures.py --self-test
+      - name: Skill copies are synchronized
+        run: python3 scripts/sync_skills.py --check

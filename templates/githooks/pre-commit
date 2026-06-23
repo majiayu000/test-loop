@@ -8,13 +8,13 @@
 # Skip with:
 #   git commit --no-verify
 #
-# Re-runs scripts/check_drift.sh --changed against the staged CaffCore files
+# Re-runs bin/check_drift.sh --changed against the staged CaffCore files
 # only, so unrelated commits (e.g. docs/ changes) are not affected.
 
 set -e
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-DRIFT_SCRIPT="$REPO_ROOT/scripts/check_drift.sh"
+DRIFT_SCRIPT="$REPO_ROOT/bin/check_drift.sh"
 
 if [[ ! -x "$DRIFT_SCRIPT" ]]; then
     echo "pre-commit: $DRIFT_SCRIPT is missing or not executable; skipping" >&2
@@ -27,7 +27,7 @@ if [[ -z "$STAGED_SOURCES" ]]; then
     exit 0
 fi
 
-echo "pre-commit: running scripts/check_drift.sh --changed on staged CaffCore files"
+echo "pre-commit: running bin/check_drift.sh --changed on staged CaffCore files"
 if bash "$DRIFT_SCRIPT" --changed; then
     exit 0
 fi
