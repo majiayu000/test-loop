@@ -91,9 +91,9 @@ regression loud than to hide it in `UNKNOWN`.
 
 ## Out of scope (v0.1)
 
-- No actual scripts under `bin/` (planned for v0.2).
-- No per-language pattern library beyond Swift (planned for v0.2).
-- No `init-loop` template generator (decision tree only).
+- No polished installer or CLI that adapts the loop automatically.
+- No fully generalized per-language pattern library beyond the current preview.
+- No automatic `init-loop` generator; agents copy and adapt templates manually.
 - No GitHub Action published under the marketplace.
 
 ## Reference projects

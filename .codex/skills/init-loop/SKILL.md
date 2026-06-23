@@ -4,7 +4,7 @@ description: |
   Install the closed test loop into a fresh project. Copies the
   pre-commit hook, the CI workflow, the render script, the drift check
   script, the failure classifier, and the knowledge-base templates,
-  then runs the drill to verify the loop reacts.
+  then prepares the drill handoff that verifies the loop reacts.
 metadata:
   type: project
   language: any
@@ -43,9 +43,9 @@ The skill writes into `target_path`:
 
 | Path | Contents |
 | --- | --- |
-| `scripts/check_drift.sh` | The drift check script. |
-| `scripts/classify_failures.py` | The failure classifier. |
-| `scripts/render_report.sh` | The report renderer. |
+| `bin/check_drift.sh` | The drift check script. |
+| `bin/classify_failures.py` | The failure classifier. |
+| `bin/render_report.sh` | The report renderer. |
 | `.githooks/pre-commit` | The drift guardrail. |
 | `.github/workflows/test.yml` | The CI workflow. |
 | `docs/knowledge/L0_overview.md` | A starter L0 file the user is expected to fill in. |
@@ -54,8 +54,9 @@ The skill writes into `target_path`:
 | `docs/spec/closed-loop.md` | A reference spec explaining the loop. |
 | `.gitignore` (append) | `docs/reports/` if not already ignored. |
 
-After writing, the skill runs the [drill](../drill/SKILL.md) procedure
-to verify the loop reacts to a real injected failure.
+After writing, the skill prepares the [drill](../drill/SKILL.md) procedure
+that verifies the loop reacts to a real injected failure. v0.1 agents should
+ask before injecting failures into a target project.
 
 ## Algorithm
 
@@ -64,13 +65,14 @@ to verify the loop reacts to a real injected failure.
    for Rust.
 2. **Refuse** if the project already has the loop and
    `existing_loop_check=true`.
-3. **Copy** each file in the table above. If the target file already
-   exists, skip it. Do not overwrite user-edited files.
+3. **Copy** each file in the table above from `bin/`, `templates/`, and
+   `templates/knowledge/`. If the target file already exists, skip it. Do not
+   overwrite user-edited files.
 4. **Configure** `git config core.hooksPath .githooks` in the target
    project, so the pre-commit hook is active.
-5. **Drill** by running the [drill](../drill/SKILL.md) skill. If the
-   drill fails, the skill exits non-zero and the user should read
-   `docs/reports/<date>/drill-*.md` to understand why.
+5. **Prepare the drill handoff** by naming the command and files the
+   [drill](../drill/SKILL.md) skill will touch. Run the drill only after the
+   user approves the injected failure.
 
 ## Worked example
 
