@@ -15,6 +15,10 @@
   `dir/**/*.ext` so top-level source files are included, and staged paths are
   scanned from index blobs so pre-commit sees the commit contents even when the
   worktree diverges.
+- `--changed` accepts an absolute `--source-glob` equal to the repository root
+  (normalized to `.`), reads the knowledge base from the index blob alongside
+  staged sources, and lists paths with `git -z` so C-quoted unusual filenames
+  are not dropped before drift scanning.
 
 ## v0.1.0 - 2026-06-23
 

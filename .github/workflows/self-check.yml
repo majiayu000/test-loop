@@ -65,6 +65,56 @@ jobs:
           test "$rc" -eq 1
           printf '%s\n' "$out" | grep -q 'TopLevelProbe'
           printf '%s\n' "$out" | grep -q 'NestedProbe'
+      - name: check_drift --changed root glob, staged L1, and -z paths
+        # Codex review follow-ups on beea636: accept absolute --source-glob
+        # equal to REPO_ROOT, read L1 from the index blob, and keep unusual
+        # filenames via NUL-terminated git path listing.
+        run: |
+          set -euo pipefail
+          REPO=$(pwd)
+
+          # 1) Absolute source-glob equal to REPO_ROOT must not exit 2.
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob "$REPO" \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language python)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -qE 'no changed python files|drift:|scanned'
+
+          # 2) Staged undocumented API must fail even if worktree L1 documents it.
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+          printf 'public struct StagedOnlyProbe {}\n' > Sources/CaffCore/StagedOnlyProbe.swift
+          git add Sources/CaffCore/StagedOnlyProbe.swift
+          printf '\nStagedOnlyProbe\n' >> "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'StagedOnlyProbe'
+          git checkout -- "$kb"
+
+          # 3) Unusual filename must still be scanned (--changed uses -z).
+          printf 'public struct CafeProbe {}\n' > "Sources/CaffCore/café.swift"
+          git add "Sources/CaffCore/café.swift"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'CafeProbe'
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

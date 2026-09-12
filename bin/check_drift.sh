@@ -81,10 +81,17 @@ if [ ! -d "$SRC_DIR" ]; then
     echo "error: $SRC_DIR not found" >&2
     exit 2
 fi
-if [[ ! -f "$L1_FILE" ]]; then
-    echo "error: $L1_FILE not found" >&2
-    exit 2
-fi
+
+# Resolve knowledge-base path relative to the repo (for index lookups).
+L1_REL="$KNOWLEDGE_BASE"
+case "$L1_REL" in
+    /*)
+        case "$L1_REL" in
+            "$REPO_ROOT"/*) L1_REL="${L1_REL#"$REPO_ROOT"/}" ;;
+            "$REPO_ROOT") L1_REL="." ;;
+        esac
+        ;;
+esac
 
 # Language -> file extension used for filtering and the awk symbol rules.
 case "$LANGUAGE" in
@@ -107,10 +114,27 @@ STAGED_FILES="$WORK/staged.txt"
 > "$LIST_OF_FILES"
 > "$STAGED_FILES"
 
+# Filter NUL-terminated git pathnames, keeping only those with LANG_EXT.
+# Line-oriented git output may C-quote unusual names (ending in .ext"), which
+# silently drops them from extension filters.
+filter_paths_z() {
+    local ext="$1"
+    while IFS= read -r -d '' path; do
+        [[ -z "$path" ]] && continue
+        case "$path" in
+            *."$ext") printf '%s\n' "$path" ;;
+        esac
+    done
+}
+
 # Decide which files to scan, in --changed mode or full mode.
 if [[ $CHANGED_ONLY -eq 1 ]]; then
     if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
         echo "error: --changed requires a git repo" >&2
+        exit 2
+    fi
+    if [[ ! -f "$L1_FILE" ]] && ! git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
+        echo "error: $L1_FILE not found" >&2
         exit 2
     fi
     # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build repo-relative
@@ -120,6 +144,7 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     case "$SRC_DIR_FOR_GIT" in
         /*)
             case "$SRC_DIR_FOR_GIT" in
+                "$REPO_ROOT") SRC_DIR_FOR_GIT="." ;;
                 "$REPO_ROOT"/*) SRC_DIR_FOR_GIT="${SRC_DIR_FOR_GIT#"$REPO_ROOT"/}" ;;
                 *)
                     echo "error: --source-glob must be inside the repository ($SRC_DIR_FOR_GIT)" >&2
@@ -128,21 +153,31 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
             esac
             ;;
     esac
-    PATHSPEC_DIRECT="${SRC_DIR_FOR_GIT}/*.${LANG_EXT}"
-    PATHSPEC_NESTED="${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}"
+    if [[ -z "$SRC_DIR_FOR_GIT" || "$SRC_DIR_FOR_GIT" == "." ]]; then
+        PATHSPEC_DIRECT="*.${LANG_EXT}"
+        PATHSPEC_NESTED="**/*.${LANG_EXT}"
+        SRC_DIR_FOR_GIT="."
+    else
+        PATHSPEC_DIRECT="${SRC_DIR_FOR_GIT}/*.${LANG_EXT}"
+        PATHSPEC_NESTED="${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}"
+    fi
     {
-        git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-    } | sort -u | grep -E "\.${LANG_EXT}$" > "$STAGED_FILES" || true
+        git -C "$REPO_ROOT" diff --cached -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+    } | filter_paths_z "$LANG_EXT" | sort -u > "$STAGED_FILES" || true
     {
-        git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-    } | sort -u | grep -E "\.${LANG_EXT}$" > "$WORK/worktree_changed.txt" || true
+        git -C "$REPO_ROOT" diff -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+        git -C "$REPO_ROOT" ls-files -z --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+    } | filter_paths_z "$LANG_EXT" | sort -u > "$WORK/worktree_changed.txt" || true
     cat "$STAGED_FILES" "$WORK/worktree_changed.txt" | sort -u > "$LIST_OF_FILES"
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
         exit 0
     fi
 else
+    if [[ ! -f "$L1_FILE" ]]; then
+        echo "error: $L1_FILE not found" >&2
+        exit 2
+    fi
     # Full mode. SOURCE_GLOB may be a path or a glob. Use find for
     # portability; -path "$SRC_DIR" matches the dir-or-anywhere patterns.
     cd "$REPO_ROOT"
@@ -154,6 +189,13 @@ else
         echo "error: no files matched $SOURCE_GLOB" >&2
         exit 2
     fi
+fi
+
+# Prefer the index blob for --changed so both sides describe the commit.
+L1_SOURCE="$L1_FILE"
+if [[ $CHANGED_ONLY -eq 1 ]] && git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
+    git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_blob.md"
+    L1_SOURCE="$WORK/l1_blob.md"
 fi
 
 # Per-language awk rules. Each rule prints "<rel_path>:<Name>".
@@ -242,7 +284,7 @@ sed -E 's|^[^:]+:||' "$EXTRACTED" | sort -u > "$EXTRACTED_NAMES"
 
 # Sorted unique identifiers appearing in L1 (strip code fences and backticks first).
 L1_NAMES="$WORK/l1_names.txt"
-sed -E 's/```[^`]*```//g' "$L1_FILE" \
+sed -E 's/```[^`]*```//g' "$L1_SOURCE" \
     | tr -cs 'A-Za-z0-9_' '\n' \
     | sort -u > "$L1_NAMES"
 
