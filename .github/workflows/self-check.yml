@@ -26,7 +26,7 @@ jobs:
           set -euo pipefail
           FIXTURE="$(mktemp -d)"
           trap 'rm -rf "$FIXTURE"' EXIT
-          mkdir -p "$FIXTURE/src/pkg" "$FIXTURE/docs/knowledge"
+          mkdir -p "$FIXTURE/src/pkg" "$FIXTURE/src/other" "$FIXTURE/src/mid/pkg" "$FIXTURE/docs/knowledge"
           cat > "$FIXTURE/src/pkg/mod.py" <<'PY'
           class DocumentedSymbol:
               pass
@@ -34,10 +34,18 @@ jobs:
           class MissingSymbol:
               pass
           PY
-          # Directory knowledge-base + ** glob: clean when both symbols are named.
+          cat > "$FIXTURE/src/other/skip_me.py" <<'PY'
+          class ShouldNotScan:
+              pass
+          PY
+          cat > "$FIXTURE/src/mid/pkg/keep.py" <<'PY'
+          class MidPkgSymbol:
+              pass
+          PY
+          # Directory knowledge-base + ** glob: clean when symbols are named.
           cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
           # API
-          DocumentedSymbol MissingSymbol
+          DocumentedSymbol MissingSymbol MidPkgSymbol ShouldNotScan
           MD
           bin/check_drift.sh \
             --language python \
@@ -46,7 +54,7 @@ jobs:
           # Same fixture, omit one symbol → expect drift (exit 1).
           cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
           # API
-          DocumentedSymbol
+          DocumentedSymbol MidPkgSymbol ShouldNotScan
           MD
           if bin/check_drift.sh \
             --language python \
@@ -58,11 +66,39 @@ jobs:
           # File-mode knowledge-base still works.
           cat > "$FIXTURE/docs/knowledge/L1_modules.md" <<'MD'
           # L1
-          DocumentedSymbol MissingSymbol
+          DocumentedSymbol MissingSymbol MidPkgSymbol ShouldNotScan
           MD
           bin/check_drift.sh \
             --language python \
             --source-glob "$FIXTURE/src/**/*.py" \
             --knowledge-base "$FIXTURE/docs/knowledge/L1_modules.md"
+          # Non-recursive single-segment glob (no GNU -maxdepth).
+          mkdir -p "$FIXTURE/top"
+          cat > "$FIXTURE/top/only.py" <<'PY'
+          class TopOnly:
+              pass
+          PY
+          mkdir -p "$FIXTURE/top/nested"
+          cat > "$FIXTURE/top/nested/deep.py" <<'PY'
+          class NestedDeep:
+              pass
+          PY
+          cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
+          # API
+          TopOnly
+          MD
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/top/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"
+          # Intermediate wildcard segments must not widen to every *.py under src.
+          cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
+          # API
+          MidPkgSymbol
+          MD
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/*/pkg/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"
       - name: Skill copies are synchronized
         run: python3 scripts/sync_skills.py --check

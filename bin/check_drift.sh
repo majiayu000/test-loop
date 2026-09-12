@@ -82,9 +82,12 @@ case "$LANGUAGE" in
         ;;
 esac
 
-# Pick the source directory for --changed / existence checks: strip a
-# trailing glob segment (e.g. /**/*.py or /*.swift) to get a real path.
-SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*\*/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*\*$||;s|/\*$||')"
+# Longest directory prefix without wildcards — used for existence checks
+# and messaging. Keeps intermediate glob segments (src/*/pkg/*.py → src).
+SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/[^/]*[\*\?].*$||')"
+if [ -z "$SRC_DIR" ]; then
+    SRC_DIR="$SOURCE_GLOB"
+fi
 if [ ! -d "$SRC_DIR" ] && [ ! -f "$SOURCE_GLOB" ]; then
     echo "error: $SRC_DIR not found" >&2
     exit 2
@@ -93,12 +96,48 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Run find | sort with pipefail so traversal errors are not masked by sort.
+find_sorted() {
+    local out="$1"
+    shift
+    local err="$WORK/find_err.txt"
+    local rc
+    set +e
+    set -o pipefail
+    "$@" 2>"$err" | sort > "$out"
+    rc=$?
+    set +o pipefail
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        cat "$err" >&2
+        return "$rc"
+    fi
+    return 0
+}
+
+# Prefer repo-relative paths when a match lives under REPO_ROOT.
+normalize_listed_paths() {
+    local infile="$1"
+    local outfile="$2"
+    > "$outfile"
+    while IFS= read -r abs; do
+        [[ -z "$abs" ]] && continue
+        case "$abs" in
+            "$REPO_ROOT"/*) printf '%s\n' "${abs#$REPO_ROOT/}" >> "$outfile" ;;
+            *)              printf '%s\n' "$abs" >> "$outfile" ;;
+        esac
+    done < "$infile"
+}
+
 # --knowledge-base may be a Markdown file or a directory of *.md files.
 # Directory mode matches the documented invocation and the drift-check skill.
 L1_FILE="$WORK/l1_combined.md"
 if [ -d "$KNOWLEDGE_BASE" ]; then
     KB_LIST="$WORK/kb_files.txt"
-    find "$KNOWLEDGE_BASE" -type f -name '*.md' | sort > "$KB_LIST"
+    if ! find_sorted "$KB_LIST" find "$KNOWLEDGE_BASE" -type f -name '*.md'; then
+        echo "error: failed to traverse knowledge base $KNOWLEDGE_BASE" >&2
+        exit 2
+    fi
     if [[ ! -s "$KB_LIST" ]]; then
         echo "error: no *.md files under $KNOWLEDGE_BASE" >&2
         exit 2
@@ -121,59 +160,58 @@ LIST_OF_FILES="$WORK/files.txt"
 > "$EXTRACTED"
 > "$LIST_OF_FILES"
 
-# Expand a source path or glob into newline-separated absolute file paths.
-# Handles directories, literal files, and ** / * patterns without relying on
-# bash globstar (unavailable on macOS bash 3.2).
+# Expand a source path or glob into newline-separated file paths.
+# Handles directories, literal files, and * / ** patterns without bash
+# globstar or GNU find -maxdepth (both unavailable on macOS bash 3.2 /
+# BSD find). Wildcard expansion uses Python's glob so intermediate
+# segments (src/*/pkg/*.py, src/**/pkg/*.py) keep their meaning.
 expand_source_glob() {
     local pattern="$1"
     local out="$2"
-    local base name_pat find_out
+    local raw="$WORK/expand_raw.txt"
 
     if [ -f "$pattern" ]; then
-        printf '%s\n' "$pattern" > "$out"
+        printf '%s\n' "$pattern" > "$raw"
+        normalize_listed_paths "$raw" "$out"
         return 0
     fi
 
     if [ -d "$pattern" ]; then
-        find "$pattern" -type f -name "*.${LANG_EXT}" | sort > "$out"
+        if ! find_sorted "$raw" find "$pattern" -type f -name "*.${LANG_EXT}"; then
+            echo "error: failed to traverse $pattern" >&2
+            return 1
+        fi
+        normalize_listed_paths "$raw" "$out"
         return 0
     fi
 
-    # pattern like /abs/src/**/*.py or /abs/Sources/CaffCore/*.swift
-    # *\** matches any path containing a literal '*'; *'**'* selects recursion.
     case "$pattern" in
-        *\**)
-            base="$(echo "$pattern" | sed -E 's|/\*\*/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*\*$||;s|/\*$||')"
-            name_pat="$(echo "$pattern" | sed -E 's|^.*/||')"
-            if [ ! -d "$base" ]; then
-                > "$out"
-                return 0
+        *\**|*\?*)
+            if ! python3 - "$pattern" "$raw" <<'PY'
+import glob
+import os
+import sys
+
+pattern, out = sys.argv[1], sys.argv[2]
+# recursive=True enables ** and preserves intermediate wildcard segments.
+matches = sorted(
+    {p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)}
+)
+with open(out, "w", encoding="utf-8") as fh:
+    for path in matches:
+        fh.write(path + "\n")
+PY
+            then
+                echo "error: failed to expand source glob $pattern" >&2
+                return 1
             fi
-            find_out="$WORK/find_out.txt"
-            # Detect ** with a quoted substring — bash 3.2 case \*\* is easy to get wrong.
-            case "$pattern" in
-                *'**'*)
-                    find "$base" -type f -name "$name_pat" | sort > "$find_out"
-                    ;;
-                *)
-                    # Single-segment globs (dir/*.ext) stay non-recursive.
-                    find "$base" -maxdepth 1 -type f -name "$name_pat" | sort > "$find_out"
-                    ;;
-            esac
-            # Prefer paths under REPO_ROOT as repo-relative; keep others absolute.
-            > "$out"
-            while IFS= read -r abs; do
-                [[ -z "$abs" ]] && continue
-                case "$abs" in
-                    "$REPO_ROOT"/*) printf '%s\n' "${abs#$REPO_ROOT/}" >> "$out" ;;
-                    *)              printf '%s\n' "$abs" >> "$out" ;;
-                esac
-            done < "$find_out"
+            normalize_listed_paths "$raw" "$out"
             return 0
             ;;
     esac
 
     > "$out"
+    return 0
 }
 
 # Decide which files to scan, in --changed mode or full mode.
@@ -182,23 +220,30 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         echo "error: --changed requires a git repo" >&2
         exit 2
     fi
-    # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build a git
-    # pathspec from the directory part (git pathspecs accept ** globs).
-    SRC_DIR_FOR_GIT="$SRC_DIR"
-    case "$SRC_DIR_FOR_GIT" in
-        "$REPO_ROOT"/*) SRC_DIR_FOR_GIT="${SRC_DIR_FOR_GIT#$REPO_ROOT/}" ;;
+    # Preserve the caller's glob as a git pathspec so restrictive patterns
+    # (e.g. dir/*.py) are not widened to dir/**/*.py. Use :(glob) so '*' does
+    # not cross '/' (git's default pathspec magic matches across directories).
+    GLOB_FOR_GIT="$SOURCE_GLOB"
+    case "$GLOB_FOR_GIT" in
+        "$REPO_ROOT"/*) GLOB_FOR_GIT="${GLOB_FOR_GIT#$REPO_ROOT/}" ;;
     esac
+    PATHSPEC=":(glob)$GLOB_FOR_GIT"
     {
-        git -C "$REPO_ROOT" diff --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-        git -C "$REPO_ROOT" diff --cached --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-    } | sort -u | grep -E "\.${LANG_EXT}$" > "$LIST_OF_FILES"
+        git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC" 2>/dev/null || true
+        git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC" 2>/dev/null || true
+        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC" 2>/dev/null || true
+    } | sort -u > "$WORK/changed_raw.txt"
+    # grep exits 1 on no matches; with set -e that must not abort before
+    # the empty-list success path below.
+    grep -E "\.${LANG_EXT}$" "$WORK/changed_raw.txt" > "$LIST_OF_FILES" || true
     if [[ ! -s "$LIST_OF_FILES" ]]; then
-        echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
+        echo "no changed $LANGUAGE files matching $GLOB_FOR_GIT; nothing to check"
         exit 0
     fi
 else
-    expand_source_glob "$SOURCE_GLOB" "$LIST_OF_FILES"
+    if ! expand_source_glob "$SOURCE_GLOB" "$LIST_OF_FILES"; then
+        exit 2
+    fi
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "error: no files matched $SOURCE_GLOB" >&2
         exit 2
