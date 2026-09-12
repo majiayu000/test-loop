@@ -21,5 +21,48 @@ jobs:
         run: bash -n bin/check_drift.sh bin/render_report.sh templates/githooks/pre-commit
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
+      - name: check_drift documented invocation smoke
+        run: |
+          set -euo pipefail
+          FIXTURE="$(mktemp -d)"
+          trap 'rm -rf "$FIXTURE"' EXIT
+          mkdir -p "$FIXTURE/src/pkg" "$FIXTURE/docs/knowledge"
+          cat > "$FIXTURE/src/pkg/mod.py" <<'PY'
+          class DocumentedSymbol:
+              pass
+
+          class MissingSymbol:
+              pass
+          PY
+          # Directory knowledge-base + ** glob: clean when both symbols are named.
+          cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
+          # API
+          DocumentedSymbol MissingSymbol
+          MD
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/**/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"
+          # Same fixture, omit one symbol → expect drift (exit 1).
+          cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
+          # API
+          DocumentedSymbol
+          MD
+          if bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/**/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"; then
+            echo "expected drift exit 1 when MissingSymbol is omitted" >&2
+            exit 1
+          fi
+          # File-mode knowledge-base still works.
+          cat > "$FIXTURE/docs/knowledge/L1_modules.md" <<'MD'
+          # L1
+          DocumentedSymbol MissingSymbol
+          MD
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/**/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge/L1_modules.md"
       - name: Skill copies are synchronized
         run: python3 scripts/sync_skills.py --check

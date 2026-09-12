@@ -57,7 +57,6 @@ case "$KNOWLEDGE_BASE" in
     /*) ;;
     *)  KNOWLEDGE_BASE="$REPO_ROOT/$KNOWLEDGE_BASE" ;;
 esac
-L1_FILE="$KNOWLEDGE_BASE"
 
 # Auto-detect language from a project manifest.
 if [ "$LANGUAGE" = "auto" ]; then
@@ -71,30 +70,6 @@ if [ "$LANGUAGE" = "auto" ]; then
     fi
 fi
 
-# Pick the source directory for --changed: the first directory segment of
-# the glob, or a known default for caff compatibility.
-SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*[^/]*$||;s|/\*\*$||')"
-if [ ! -d "$SRC_DIR" ]; then
-    echo "error: $SRC_DIR not found" >&2
-    exit 2
-fi
-if [[ ! -f "$L1_FILE" ]]; then
-    echo "error: $L1_FILE not found" >&2
-    exit 2
-fi
-
-CHANGED_ONLY=0
-for arg in "$@"; do
-    case "$arg" in
-        --changed) CHANGED_ONLY=1 ;;
-        -h|--help)
-            sed -n '3,22p' "$0"
-            exit 0
-            ;;
-        *) echo "unknown arg: $arg" >&2; exit 2 ;;
-    esac
-done
-
 # Language -> file extension used for filtering and the awk symbol rules.
 case "$LANGUAGE" in
     swift)  LANG_EXT="swift" ;;
@@ -107,12 +82,99 @@ case "$LANGUAGE" in
         ;;
 esac
 
+# Pick the source directory for --changed / existence checks: strip a
+# trailing glob segment (e.g. /**/*.py or /*.swift) to get a real path.
+SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*\*/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*\*$||;s|/\*$||')"
+if [ ! -d "$SRC_DIR" ] && [ ! -f "$SOURCE_GLOB" ]; then
+    echo "error: $SRC_DIR not found" >&2
+    exit 2
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# --knowledge-base may be a Markdown file or a directory of *.md files.
+# Directory mode matches the documented invocation and the drift-check skill.
+L1_FILE="$WORK/l1_combined.md"
+if [ -d "$KNOWLEDGE_BASE" ]; then
+    KB_LIST="$WORK/kb_files.txt"
+    find "$KNOWLEDGE_BASE" -type f -name '*.md' | sort > "$KB_LIST"
+    if [[ ! -s "$KB_LIST" ]]; then
+        echo "error: no *.md files under $KNOWLEDGE_BASE" >&2
+        exit 2
+    fi
+    > "$L1_FILE"
+    while IFS= read -r kb; do
+        [[ -z "$kb" ]] && continue
+        cat "$kb" >> "$L1_FILE"
+        printf '\n' >> "$L1_FILE"
+    done < "$KB_LIST"
+elif [ -f "$KNOWLEDGE_BASE" ]; then
+    cp "$KNOWLEDGE_BASE" "$L1_FILE"
+else
+    echo "error: $KNOWLEDGE_BASE not found" >&2
+    exit 2
+fi
+
 EXTRACTED="$WORK/extracted.txt"
 LIST_OF_FILES="$WORK/files.txt"
 > "$EXTRACTED"
 > "$LIST_OF_FILES"
+
+# Expand a source path or glob into newline-separated absolute file paths.
+# Handles directories, literal files, and ** / * patterns without relying on
+# bash globstar (unavailable on macOS bash 3.2).
+expand_source_glob() {
+    local pattern="$1"
+    local out="$2"
+    local base name_pat find_out
+
+    if [ -f "$pattern" ]; then
+        printf '%s\n' "$pattern" > "$out"
+        return 0
+    fi
+
+    if [ -d "$pattern" ]; then
+        find "$pattern" -type f -name "*.${LANG_EXT}" | sort > "$out"
+        return 0
+    fi
+
+    # pattern like /abs/src/**/*.py or /abs/Sources/CaffCore/*.swift
+    # *\** matches any path containing a literal '*'; *'**'* selects recursion.
+    case "$pattern" in
+        *\**)
+            base="$(echo "$pattern" | sed -E 's|/\*\*/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*[^.]*\.[A-Za-z0-9]+$||;s|/\*\*$||;s|/\*$||')"
+            name_pat="$(echo "$pattern" | sed -E 's|^.*/||')"
+            if [ ! -d "$base" ]; then
+                > "$out"
+                return 0
+            fi
+            find_out="$WORK/find_out.txt"
+            # Detect ** with a quoted substring — bash 3.2 case \*\* is easy to get wrong.
+            case "$pattern" in
+                *'**'*)
+                    find "$base" -type f -name "$name_pat" | sort > "$find_out"
+                    ;;
+                *)
+                    # Single-segment globs (dir/*.ext) stay non-recursive.
+                    find "$base" -maxdepth 1 -type f -name "$name_pat" | sort > "$find_out"
+                    ;;
+            esac
+            # Prefer paths under REPO_ROOT as repo-relative; keep others absolute.
+            > "$out"
+            while IFS= read -r abs; do
+                [[ -z "$abs" ]] && continue
+                case "$abs" in
+                    "$REPO_ROOT"/*) printf '%s\n' "${abs#$REPO_ROOT/}" >> "$out" ;;
+                    *)              printf '%s\n' "$abs" >> "$out" ;;
+                esac
+            done < "$find_out"
+            return 0
+            ;;
+    esac
+
+    > "$out"
+}
 
 # Decide which files to scan, in --changed mode or full mode.
 if [[ $CHANGED_ONLY -eq 1 ]]; then
@@ -121,8 +183,11 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         exit 2
     fi
     # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build a git
-    # pathspec from the directory part (git pathspecs accept dir/* glob).
-    SRC_DIR_FOR_GIT="$(echo "$SOURCE_GLOB" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
+    # pathspec from the directory part (git pathspecs accept ** globs).
+    SRC_DIR_FOR_GIT="$SRC_DIR"
+    case "$SRC_DIR_FOR_GIT" in
+        "$REPO_ROOT"/*) SRC_DIR_FOR_GIT="${SRC_DIR_FOR_GIT#$REPO_ROOT/}" ;;
+    esac
     {
         git -C "$REPO_ROOT" diff --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
         git -C "$REPO_ROOT" diff --cached --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
@@ -133,13 +198,7 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         exit 0
     fi
 else
-    # Full mode. SOURCE_GLOB may be a path or a glob. Use find for
-    # portability; -path "$SRC_DIR" matches the dir-or-anywhere patterns.
-    cd "$REPO_ROOT"
-    # shellcheck disable=SC2086
-    find . -path "$SOURCE_GLOB" -type f 2>/dev/null \
-        | sed 's|^\./||' > "$LIST_OF_FILES" \
-        || find "$SOURCE_GLOB" -type f 2>/dev/null | sed "s|^$REPO_ROOT/||" >> "$LIST_OF_FILES"
+    expand_source_glob "$SOURCE_GLOB" "$LIST_OF_FILES"
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "error: no files matched $SOURCE_GLOB" >&2
         exit 2
@@ -214,9 +273,17 @@ emit_awk() {
 
 while IFS= read -r rel; do
     [[ -z "$rel" ]] && continue
-    f="$REPO_ROOT/$rel"
+    case "$rel" in
+        /*) f="$rel" ;;
+        *)  f="$REPO_ROOT/$rel" ;;
+    esac
     [[ -f "$f" ]] || continue
-    emit_awk "$rel" < "$f" >> "$EXTRACTED" 2>/dev/null || true
+    # Report repo-relative paths when possible; otherwise keep absolute.
+    case "$f" in
+        "$REPO_ROOT"/*) display="${f#$REPO_ROOT/}" ;;
+        *)              display="$f" ;;
+    esac
+    emit_awk "$display" < "$f" >> "$EXTRACTED" 2>/dev/null || true
 done < "$LIST_OF_FILES"
 
 # Sorted unique names extracted from sources.
@@ -285,7 +352,7 @@ while IFS= read -r name; do
     grep -E ":${name}$" "$EXTRACTED" | head -3 | sed 's/^/  - /'
 done < "$MISSING"
 echo
-echo "Fix: add the symbol to docs/knowledge/L1_modules.md (or update the"
-echo "     L1_BASELINE list in scripts/check_drift.sh if it is intentionally"
+echo "Fix: add the symbol to the knowledge base (or update the"
+echo "     L1_BASELINE list in bin/check_drift.sh if it is intentionally"
 echo "     undocumented)."
 exit 1
