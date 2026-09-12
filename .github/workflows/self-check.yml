@@ -19,6 +19,28 @@ jobs:
           python-version: "3.x"
       - name: Syntax check shell scripts
         run: bash -n bin/check_drift.sh bin/render_report.sh templates/githooks/pre-commit
+      - name: check_drift --changed takes changed-only path
+        # Regression for LOGIC-01: a dead second argv parser used to reset
+        # CHANGED_ONLY=0 after the first parser had already shift'ed argv
+        # empty, so --changed always fell through to full mode. With a
+        # real source dir + knowledge base and no matching dirty files,
+        # changed-only mode must exit 0 with the "no changed … files"
+        # message (full mode would error with "no files matched").
+        run: |
+          set -euo pipefail
+          resets=$(grep -cE '^CHANGED_ONLY=0$' bin/check_drift.sh)
+          if [ "$resets" -ne 1 ]; then
+            echo "error: expected exactly one CHANGED_ONLY=0 assignment (initial default), found $resets" >&2
+            grep -nE '^CHANGED_ONLY=0$' bin/check_drift.sh >&2 || true
+            exit 1
+          fi
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'bin' \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language python)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'no changed python files'
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

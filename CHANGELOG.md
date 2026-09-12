@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `bin/check_drift.sh --changed` now keeps the first parser's `CHANGED_ONLY=1`
+  value. A dead second argument-parsing block had reset `CHANGED_ONLY=0` after
+  `shift` emptied argv, so changed-only mode never activated (LOGIC-01). The
+  empty changed-file `grep` is also tolerated under `set -e` so the documented
+  "no changed … files" exit 0 path is reachable. Self-check CI now smokes the
+  changed-only path.
+
 ## v0.1.0 - 2026-06-23
 
 Initial public release of test-loop as a contract package for closed test-loop

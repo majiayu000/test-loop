@@ -83,18 +83,6 @@ if [[ ! -f "$L1_FILE" ]]; then
     exit 2
 fi
 
-CHANGED_ONLY=0
-for arg in "$@"; do
-    case "$arg" in
-        --changed) CHANGED_ONLY=1 ;;
-        -h|--help)
-            sed -n '3,22p' "$0"
-            exit 0
-            ;;
-        *) echo "unknown arg: $arg" >&2; exit 2 ;;
-    esac
-done
-
 # Language -> file extension used for filtering and the awk symbol rules.
 case "$LANGUAGE" in
     swift)  LANG_EXT="swift" ;;
@@ -127,7 +115,7 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         git -C "$REPO_ROOT" diff --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
         git -C "$REPO_ROOT" diff --cached --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
         git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-    } | sort -u | grep -E "\.${LANG_EXT}$" > "$LIST_OF_FILES"
+    } | sort -u | grep -E "\.${LANG_EXT}$" > "$LIST_OF_FILES" || true
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
         exit 0
