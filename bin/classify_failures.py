@@ -145,6 +145,41 @@ DEFAULT_CLASS = "ASSERTION_FAILURE"
 FALLBACK_CLASS = "UNKNOWN"
 
 
+def detect_language(log_text: str) -> str:
+    """Sniff log_text against EXTRACT_PATTERNS and return the winning language.
+
+    Scores each known runner by how many failure lines match its extract
+    pattern. The language with the highest hit count wins; ties break by
+    EXTRACT_PATTERNS insertion order (swift, python, go, rust).
+
+    Raises ValueError when no pattern matches any line.
+    """
+    scores: dict[str, int] = {
+        lang: sum(1 for _ in rx.finditer(log_text))
+        for lang, rx in EXTRACT_PATTERNS.items()
+    }
+    best = max(scores.values(), default=0)
+    if best == 0:
+        raise ValueError(
+            "auto-detect failed: no known test-runner failure lines found "
+            "(expected swift ✘ Test, pytest FAILED, go --- FAIL, "
+            "or cargo test ... FAILED)"
+        )
+    for lang, count in scores.items():
+        if count == best:
+            return lang
+    raise ValueError("auto-detect failed: no winning language")  # pragma: no cover
+
+
+def resolve_language(log_text: str, language: str) -> str:
+    """Resolve ``auto`` to a concrete language; validate explicit choices."""
+    if language == "auto":
+        return detect_language(log_text)
+    if language not in EXTRACT_PATTERNS:
+        raise ValueError(f"unsupported language: {language!r}")
+    return language
+
+
 def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     """Pull failing test names out of a test log, deduplicated.
 
@@ -153,10 +188,10 @@ def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     the first-seen order so callers see one entry per failing test.
 
     The line shape depends on the runner; see EXTRACT_PATTERNS.
+    Pass ``language="auto"`` to sniff the log and pick a runner first.
     """
-    rx = EXTRACT_PATTERNS.get(language)
-    if rx is None:
-        raise ValueError(f"unsupported language: {language!r}")
+    language = resolve_language(log_text, language)
+    rx = EXTRACT_PATTERNS[language]
     seen: dict[str, None] = {}
     for m in rx.finditer(log_text):
         name = m.group(1).strip()
@@ -215,8 +250,14 @@ def main(argv: list[str]) -> int:
     with open(log_path, "r", encoding="utf-8") as f:
         log_text = f.read()
 
-    names = extract_failing_names(log_text, language=args.language)
-    grouped = classify_all(names, language=args.language)
+    try:
+        language = resolve_language(log_text, args.language)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    names = extract_failing_names(log_text, language=language)
+    grouped = classify_all(names, language=language)
     counts = Counter({label: len(items) for label, items in grouped.items()})
 
     payload = {
@@ -420,6 +461,58 @@ test result: FAILED. 2 passed; 2 failed; 0 ignored
         counts = Counter({label: len(items) for label, items in grouped.items()})
         self.assertEqual(counts["EXPECTED_FAILURE"], 2)
         self.assertEqual(counts["IO_BACKEND"], 1)
+
+    def test_auto_detects_swift(self) -> None:
+        log = """
+✘ Test foo() failed after 0.002 seconds with 1 issue.
+✘ Test bar() failed after 0.001 seconds with 1 issue.
+"""
+        self.assertEqual(detect_language(log), "swift")
+        self.assertEqual(
+            extract_failing_names(log, language="auto"),
+            ["foo", "bar"],
+        )
+
+    def test_auto_detects_python(self) -> None:
+        log = """
+FAILED test_module.py::test_rejects_invalid_input
+FAILED test_module.py::test_handles_missing_data
+"""
+        self.assertEqual(detect_language(log), "python")
+        self.assertEqual(
+            extract_failing_names(log, language="auto"),
+            ["test_rejects_invalid_input", "test_handles_missing_data"],
+        )
+
+    def test_auto_detects_go(self) -> None:
+        log = """
+--- FAIL: TestRejectsEmpty (0.00s)
+--- FAIL: TestBar (0.00s)
+"""
+        self.assertEqual(detect_language(log), "go")
+        self.assertEqual(
+            extract_failing_names(log, language="auto"),
+            ["TestRejectsEmpty", "TestBar"],
+        )
+
+    def test_auto_detects_rust(self) -> None:
+        log = """
+test test_rejects_empty ... FAILED
+test test_with_invalid_input ... FAILED
+"""
+        self.assertEqual(detect_language(log), "rust")
+        self.assertEqual(
+            extract_failing_names(log, language="auto"),
+            ["test_rejects_empty", "test_with_invalid_input"],
+        )
+
+    def test_auto_detect_no_match_raises(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            detect_language("no failure lines here\nall green\n")
+        self.assertIn("auto-detect failed", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            extract_failing_names("empty", language="auto")
+        self.assertIn("auto-detect failed", str(ctx.exception))
 
 
 if __name__ == "__main__":
