@@ -100,5 +100,48 @@ jobs:
             --language python \
             --source-glob "$FIXTURE/src/*/pkg/*.py" \
             --knowledge-base "$FIXTURE/docs/knowledge"
+          # Unreadable subtree under a ** glob must fail closed (not report clean).
+          mkdir -p "$FIXTURE/src/locked"
+          cat > "$FIXTURE/src/locked/hidden_sym.py" <<'PY'
+          class LockedMissing:
+              pass
+          PY
+          chmod 000 "$FIXTURE/src/locked"
+          cat > "$FIXTURE/docs/knowledge/api.md" <<'MD'
+          # API
+          DocumentedSymbol MissingSymbol MidPkgSymbol ShouldNotScan
+          MD
+          if bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/**/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"; then
+            chmod 755 "$FIXTURE/src/locked" || true
+            echo "expected expansion failure on unreadable subtree" >&2
+            exit 1
+          fi
+          chmod 755 "$FIXTURE/src/locked"
+          # --changed must ignore hidden paths that full-mode glob excludes.
+          # Fixture must live inside this git work tree so ls-files can see it.
+          HFIX="$(mktemp -d "$PWD/ci-drift-XXXXXX")"
+          mkdir -p "$HFIX/src/.nest" "$HFIX/docs"
+          cat > "$HFIX/docs/api.md" <<'MD'
+          # API
+          MD
+          cat > "$HFIX/src/.dot.py" <<'PY'
+          class DotFileSymbol:
+              pass
+          PY
+          cat > "$HFIX/src/.nest/x.py" <<'PY'
+          class NestHiddenSymbol:
+              pass
+          PY
+          REL_HFIX="${HFIX#$PWD/}"
+          OUT="$(bin/check_drift.sh \
+            --language python \
+            --changed \
+            --source-glob "$REL_HFIX/src/**/*.py" \
+            --knowledge-base "$REL_HFIX/docs/api.md")"
+          rm -rf "$HFIX"
+          echo "$OUT" | grep -q 'nothing to check'
       - name: Skill copies are synchronized
         run: python3 scripts/sync_skills.py --check

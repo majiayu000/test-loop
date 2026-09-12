@@ -129,6 +129,21 @@ normalize_listed_paths() {
     done < "$infile"
 }
 
+# Drop paths with any hidden component (leading '.') so --changed matches
+# full-mode Python glob semantics (include_hidden=False / leading-dot skip).
+filter_visible_paths() {
+    local infile="$1"
+    local outfile="$2"
+    > "$outfile"
+    while IFS= read -r rel; do
+        [[ -z "$rel" ]] && continue
+        case "/$rel/" in
+            */.*/*|*/.*/) continue ;;
+        esac
+        printf '%s\n' "$rel" >> "$outfile"
+    done < "$infile"
+}
+
 # --knowledge-base may be a Markdown file or a directory of *.md files.
 # Directory mode matches the documented invocation and the drift-check skill.
 L1_FILE="$WORK/l1_combined.md"
@@ -193,6 +208,47 @@ import os
 import sys
 
 pattern, out = sys.argv[1], sys.argv[2]
+
+
+def literal_prefix(pat: str) -> str:
+    """Longest path prefix before the first glob metacharacter."""
+    sep = os.sep
+    parts = pat.split(sep)
+    acc = []
+    for i, part in enumerate(parts):
+        if i == 0 and part == "":
+            acc.append("")
+            continue
+        if any(c in part for c in "*?["):
+            break
+        acc.append(part)
+    if not acc:
+        return "."
+    prefix = sep.join(acc)
+    if prefix == "":
+        return sep
+    return prefix
+
+
+# glob.glob swallows OSError from unreadable directories via _listdir and can
+# report a clean scan while public symbols under those trees were skipped.
+# Probe the literal prefix with os.walk(..., onerror=...) and fail closed.
+root = literal_prefix(pattern)
+errors = []
+
+
+def on_walk_error(err: OSError) -> None:
+    errors.append(err)
+
+
+if os.path.isdir(root):
+    for _dirpath, _dirnames, _filenames in os.walk(root, onerror=on_walk_error):
+        pass
+    if errors:
+        for err in errors:
+            sys.stderr.write(f"{err}\n")
+        sys.exit(1)
+
 # recursive=True enables ** and preserves intermediate wildcard segments.
 matches = sorted(
     {p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)}
@@ -234,8 +290,10 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC" 2>/dev/null || true
     } | sort -u > "$WORK/changed_raw.txt"
     # grep exits 1 on no matches; with set -e that must not abort before
-    # the empty-list success path below.
-    grep -E "\.${LANG_EXT}$" "$WORK/changed_raw.txt" > "$LIST_OF_FILES" || true
+    # the empty-list success path below. Then drop hidden-component paths so
+    # :(glob) matches full-mode glob (which skips leading-dot names).
+    grep -E "\.${LANG_EXT}$" "$WORK/changed_raw.txt" > "$WORK/changed_ext.txt" || true
+    filter_visible_paths "$WORK/changed_ext.txt" "$LIST_OF_FILES"
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files matching $GLOB_FOR_GIT; nothing to check"
         exit 0
