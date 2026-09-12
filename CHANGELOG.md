@@ -10,6 +10,11 @@
   empty changed-file `grep` is also tolerated under `set -e` so the documented
   "no changed … files" exit 0 path is reachable. Self-check CI now smokes the
   changed-only path.
+- `--changed` git pathspecs stay repository-relative (absolute `SOURCE_GLOB`
+  prefixes no longer silence matches), cover both `dir/*.ext` and
+  `dir/**/*.ext` so top-level source files are included, and staged paths are
+  scanned from index blobs so pre-commit sees the commit contents even when the
+  worktree diverges.
 
 ## v0.1.0 - 2026-06-23
 

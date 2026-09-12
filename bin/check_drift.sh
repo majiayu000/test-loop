@@ -48,7 +48,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Resolve repo-root-relative paths.
+# Keep the caller-facing glob for git pathspecs (must stay repo-relative).
+SOURCE_GLOB_INPUT="$SOURCE_GLOB"
+
+# Resolve repo-root-relative paths for filesystem checks / full-mode find.
 case "$SOURCE_GLOB" in
     /*) ;;
     *)  SOURCE_GLOB="$REPO_ROOT/$SOURCE_GLOB" ;;
@@ -99,8 +102,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 EXTRACTED="$WORK/extracted.txt"
 LIST_OF_FILES="$WORK/files.txt"
+STAGED_FILES="$WORK/staged.txt"
 > "$EXTRACTED"
 > "$LIST_OF_FILES"
+> "$STAGED_FILES"
 
 # Decide which files to scan, in --changed mode or full mode.
 if [[ $CHANGED_ONLY -eq 1 ]]; then
@@ -108,14 +113,31 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         echo "error: --changed requires a git repo" >&2
         exit 2
     fi
-    # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build a git
-    # pathspec from the directory part (git pathspecs accept dir/* glob).
-    SRC_DIR_FOR_GIT="$(echo "$SOURCE_GLOB" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
+    # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build repo-relative
+    # git pathspecs: absolute pathspecs do not match, and ** alone omits files
+    # directly under the source directory.
+    SRC_DIR_FOR_GIT="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
+    case "$SRC_DIR_FOR_GIT" in
+        /*)
+            case "$SRC_DIR_FOR_GIT" in
+                "$REPO_ROOT"/*) SRC_DIR_FOR_GIT="${SRC_DIR_FOR_GIT#"$REPO_ROOT"/}" ;;
+                *)
+                    echo "error: --source-glob must be inside the repository ($SRC_DIR_FOR_GIT)" >&2
+                    exit 2
+                    ;;
+            esac
+            ;;
+    esac
+    PATHSPEC_DIRECT="${SRC_DIR_FOR_GIT}/*.${LANG_EXT}"
+    PATHSPEC_NESTED="${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}"
     {
-        git -C "$REPO_ROOT" diff --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-        git -C "$REPO_ROOT" diff --cached --name-only -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}" 2>/dev/null || true
-    } | sort -u | grep -E "\.${LANG_EXT}$" > "$LIST_OF_FILES" || true
+        git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+    } | sort -u | grep -E "\.${LANG_EXT}$" > "$STAGED_FILES" || true
+    {
+        git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+    } | sort -u | grep -E "\.${LANG_EXT}$" > "$WORK/worktree_changed.txt" || true
+    cat "$STAGED_FILES" "$WORK/worktree_changed.txt" | sort -u > "$LIST_OF_FILES"
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
         exit 0
@@ -202,6 +224,13 @@ emit_awk() {
 
 while IFS= read -r rel; do
     [[ -z "$rel" ]] && continue
+    # Staged paths are scanned from the index blob so --changed matches what
+    # pre-commit will commit, even when the worktree diverges.
+    if [[ $CHANGED_ONLY -eq 1 ]] && grep -Fxq -- "$rel" "$STAGED_FILES" 2>/dev/null; then
+        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+            | emit_awk "$rel" >> "$EXTRACTED" 2>/dev/null || true
+        continue
+    fi
     f="$REPO_ROOT/$rel"
     [[ -f "$f" ]] || continue
     emit_awk "$rel" < "$f" >> "$EXTRACTED" 2>/dev/null || true

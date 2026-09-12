@@ -41,6 +41,30 @@ jobs:
             --language python)
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -q 'no changed python files'
+      - name: check_drift --changed pathspecs and staged blobs
+        # Codex review follow-ups: relative pathspecs, direct children under
+        # the source dir, and index-blob scanning for staged paths.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore/Nested
+          printf 'public struct TopLevelProbe {}\n' > Sources/CaffCore/TopLevelProbe.swift
+          printf 'public struct NestedProbe {}\n' > Sources/CaffCore/Nested/NestedProbe.swift
+          git add Sources/CaffCore/TopLevelProbe.swift Sources/CaffCore/Nested/NestedProbe.swift
+          # Drop the worktree copy so only the index blob remains for the
+          # top-level file; --changed must still see TopLevelProbe.
+          rm Sources/CaffCore/TopLevelProbe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'TopLevelProbe'
+          printf '%s\n' "$out" | grep -q 'NestedProbe'
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
