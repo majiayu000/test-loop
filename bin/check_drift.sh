@@ -155,7 +155,10 @@ filter_visible_paths() {
     esac
 
     # Explicitly named leading-dot path segments in the caller glob.
+    # Exact segments (src/.generated/*.py) and dot-leading wildcards
+    # (src/.*/h.py) both keep matching hidden path components.
     local explicit_hidden=""
+    local explicit_hidden_globs=""
     local seg
     local _saved_ifs="$IFS"
     set -f
@@ -169,8 +172,12 @@ filter_visible_paths() {
             .|..|'') continue ;;
             .*)
                 case "$seg" in
-                    *'*'*|*'?'*|*'['*) ;;
-                    *) explicit_hidden="$explicit_hidden/$seg/" ;;
+                    *'*'*|*'?'*|*'['*)
+                        explicit_hidden_globs="$explicit_hidden_globs|$seg"
+                        ;;
+                    *)
+                        explicit_hidden="$explicit_hidden/$seg/"
+                        ;;
                 esac
                 ;;
         esac
@@ -179,20 +186,53 @@ filter_visible_paths() {
     while IFS= read -r rel; do
         [[ -z "$rel" ]] && continue
         local keep=1
-        set -f
-        IFS='/'
-        # shellcheck disable=SC2086
-        set -- $rel
-        IFS="$_saved_ifs"
-        set +f
-        for seg in "$@"; do
+        local path_segs="$rel"
+        while [ -n "$path_segs" ]; do
+            case "$path_segs" in
+                */*)
+                    seg="${path_segs%%/*}"
+                    path_segs="${path_segs#*/}"
+                    ;;
+                *)
+                    seg="$path_segs"
+                    path_segs=""
+                    ;;
+            esac
             case "$seg" in
                 .|..|'') continue ;;
                 .*)
+                    local allow_hidden=0
                     case "$explicit_hidden" in
-                        */"$seg"/*) ;;
-                        *) keep=0; break ;;
+                        */"$seg"/*) allow_hidden=1 ;;
                     esac
+                    if [ "$allow_hidden" -eq 0 ] && [ -n "$explicit_hidden_globs" ]; then
+                        local g
+                        local glob_rest="$explicit_hidden_globs"
+                        while [ -n "$glob_rest" ]; do
+                            case "$glob_rest" in
+                                \|*) glob_rest="${glob_rest#|}" ;;
+                            esac
+                            [ -z "$glob_rest" ] && break
+                            case "$glob_rest" in
+                                *\|*)
+                                    g="${glob_rest%%|*}"
+                                    glob_rest="${glob_rest#*|}"
+                                    ;;
+                                *)
+                                    g="$glob_rest"
+                                    glob_rest=""
+                                    ;;
+                            esac
+                            [[ -z "$g" ]] && continue
+                            case "$seg" in
+                                $g) allow_hidden=1; break ;;
+                            esac
+                        done
+                    fi
+                    if [ "$allow_hidden" -eq 0 ]; then
+                        keep=0
+                        break
+                    fi
                     ;;
             esac
         done
@@ -292,21 +332,76 @@ def literal_prefix(pat: str) -> str:
 
 # glob.glob swallows OSError from unreadable directories via _listdir and can
 # report a clean scan while public symbols under those trees were skipped.
-# Probe the literal prefix with os.walk(..., onerror=...) and fail closed.
-# followlinks=True matches glob.glob, which follows symlinked directories.
+# Probe only directories the glob can enter (not every descendant of the
+# literal prefix). followlinks=True matches glob.glob symlink behavior.
 root = literal_prefix(pattern)
 errors = []
 
 
-def on_walk_error(err: OSError) -> None:
+def on_walk_error(err):
     errors.append(err)
 
 
+def pattern_dir_parts(pat, prefix):
+    """Directory segments after the literal prefix (excludes final file glob)."""
+    if pat == prefix:
+        return []
+    if prefix in ("", os.sep):
+        rel = pat.lstrip(os.sep)
+    elif pat.startswith(prefix + os.sep):
+        rel = pat[len(prefix) + 1 :]
+    elif pat.startswith(prefix):
+        rel = pat[len(prefix) :].lstrip(os.sep)
+    else:
+        rel = pat
+    parts = [p for p in rel.split(os.sep) if p]
+    if not parts:
+        return []
+    return parts[:-1]
+
+
+def name_matches(part, name):
+    """Match one path segment the way glob.glob does (hidden names)."""
+    import fnmatch
+
+    if any(c in part for c in "*?["):
+        if not part.startswith(".") and name.startswith("."):
+            return False
+        return fnmatch.fnmatch(name, part)
+    return name == part
+
+
+def probe_reachable(base, dir_parts):
+    """Fail closed on unreadable dirs the glob would attempt to enter."""
+    try:
+        entries = list(os.scandir(base))
+    except OSError as err:
+        on_walk_error(err)
+        return
+    if not dir_parts:
+        return
+    part, rest = dir_parts[0], dir_parts[1:]
+    if part == "**":
+        for _dirpath, _dirnames, _filenames in os.walk(
+            base, onerror=on_walk_error, followlinks=True
+        ):
+            pass
+        return
+    for entry in entries:
+        try:
+            is_dir = entry.is_dir(follow_symlinks=True)
+        except OSError as err:
+            on_walk_error(err)
+            continue
+        if not is_dir:
+            continue
+        if not name_matches(part, entry.name):
+            continue
+        probe_reachable(entry.path, rest)
+
+
 if os.path.isdir(root):
-    for _dirpath, _dirnames, _filenames in os.walk(
-        root, onerror=on_walk_error, followlinks=True
-    ):
-        pass
+    probe_reachable(root, pattern_dir_parts(pattern, root))
     if errors:
         for err in errors:
             sys.stderr.write(f"{err}\n")
@@ -361,6 +456,14 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC" 2>/dev/null || true
         git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC" 2>/dev/null || true
     } | sort -u > "$WORK/changed_raw.txt"
+    # Track staged vs unstaged/untracked so symbol extraction can read the
+    # index blob for cached paths (pre-commit) instead of only the worktree.
+    git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC" 2>/dev/null \
+        | sort -u > "$WORK/changed_cached.txt" || true
+    {
+        git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC" 2>/dev/null || true
+        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC" 2>/dev/null || true
+    } | sort -u > "$WORK/changed_worktree.txt" || true
     # grep exits 1 on no matches; with set -e that must not abort before
     # the empty-list success path below. Then drop hidden-component paths so
     # :(glob) matches full-mode glob (which skips leading-dot names), while
@@ -372,6 +475,8 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
         exit 0
     fi
 else
+    > "$WORK/changed_cached.txt"
+    > "$WORK/changed_worktree.txt"
     if ! expand_source_glob "$SOURCE_GLOB" "$LIST_OF_FILES"; then
         exit 2
     fi
@@ -453,13 +558,31 @@ while IFS= read -r rel; do
         /*) f="$rel" ;;
         *)  f="$REPO_ROOT/$rel" ;;
     esac
-    [[ -f "$f" ]] || continue
     # Report repo-relative paths when possible; otherwise keep absolute.
     case "$f" in
         "$REPO_ROOT"/*) display="${f#$REPO_ROOT/}" ;;
         *)              display="$f" ;;
     esac
-    emit_awk "$display" < "$f" >> "$EXTRACTED" 2>/dev/null || true
+    scanned=0
+    if [[ $CHANGED_ONLY -eq 1 ]] && grep -qxF "$rel" "$WORK/changed_cached.txt" 2>/dev/null; then
+        # Staged content may differ from the worktree (partial staging). Parse
+        # the index blob so pre-commit sees symbols that would be committed.
+        if git -C "$REPO_ROOT" cat-file -e ":$rel" 2>/dev/null; then
+            git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+                | emit_awk "$display" >> "$EXTRACTED" 2>/dev/null || true
+            scanned=1
+        fi
+    fi
+    if [[ $CHANGED_ONLY -eq 0 ]] || grep -qxF "$rel" "$WORK/changed_worktree.txt" 2>/dev/null; then
+        if [[ -f "$f" ]]; then
+            emit_awk "$display" < "$f" >> "$EXTRACTED" 2>/dev/null || true
+            scanned=1
+        fi
+    fi
+    # Fallback for odd paths that did not classify as cached/worktree.
+    if [[ $scanned -eq 0 && -f "$f" ]]; then
+        emit_awk "$display" < "$f" >> "$EXTRACTED" 2>/dev/null || true
+    fi
 done < "$LIST_OF_FILES"
 
 # Sorted unique names extracted from sources.

@@ -56,11 +56,15 @@ jobs:
           # API
           DocumentedSymbol MidPkgSymbol ShouldNotScan
           MD
-          if bin/check_drift.sh \
+          set +e
+          bin/check_drift.sh \
             --language python \
             --source-glob "$FIXTURE/src/**/*.py" \
-            --knowledge-base "$FIXTURE/docs/knowledge"; then
-            echo "expected drift exit 1 when MissingSymbol is omitted" >&2
+            --knowledge-base "$FIXTURE/docs/knowledge"
+          drift_status=$?
+          set -e
+          if [ "$drift_status" -ne 1 ]; then
+            echo "expected drift exit 1 when MissingSymbol is omitted, got $drift_status" >&2
             exit 1
           fi
           # File-mode knowledge-base still works.
