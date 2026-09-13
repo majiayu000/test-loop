@@ -65,6 +65,9 @@ jobs:
           test "$rc" -eq 1
           printf '%s\n' "$out" | grep -q 'TopLevelProbe'
           printf '%s\n' "$out" | grep -q 'NestedProbe'
+          # Isolate later steps: do not leave probe blobs staged in the index.
+          git reset HEAD -- Sources/CaffCore/TopLevelProbe.swift Sources/CaffCore/Nested/NestedProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
       - name: check_drift --changed root glob, staged L1, and -z paths
         # Codex review follow-ups on beea636: accept absolute --source-glob
         # equal to REPO_ROOT, read L1 from the index blob, and keep unusual
@@ -115,6 +118,10 @@ jobs:
           printf '%s\n' "$out"
           test "$rc" -eq 1
           printf '%s\n' "$out" | grep -q 'CafeProbe'
+          # Isolate later steps: drop staged probes and restore L1 worktree.
+          git reset HEAD -- Sources/CaffCore/StagedOnlyProbe.swift "Sources/CaffCore/café.swift" 2>/dev/null || true
+          git checkout -- "$kb"
+          rm -rf Sources/CaffCore
       - name: check_drift staged-only, worktree L1, deleted index KB, escape
         # Codex review follow-ups on e472247.
         run: |
