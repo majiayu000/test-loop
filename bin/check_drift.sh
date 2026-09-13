@@ -84,7 +84,8 @@ esac
 
 # Longest directory prefix without wildcards — used for existence checks
 # and messaging. Keeps intermediate glob segments (src/*/pkg/*.py → src).
-SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/[^/]*[\*\?].*$||')"
+# Bracket expressions ([ab]) are wildcards, same as * and ?.
+SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/[^/]*[*?\[].*$||')"
 if [ -z "$SRC_DIR" ]; then
     SRC_DIR="$SOURCE_GLOB"
 fi
@@ -129,18 +130,75 @@ normalize_listed_paths() {
     done < "$infile"
 }
 
-# Drop paths with any hidden component (leading '.') so --changed matches
-# full-mode Python glob semantics (include_hidden=False / leading-dot skip).
+# Drop paths with hidden components that an implicit wildcard would skip,
+# matching full-mode Python glob / find semantics. Literal directories and
+# explicitly named leading-dot segments (e.g. src/.generated/*.py) are kept.
 filter_visible_paths() {
     local infile="$1"
     local outfile="$2"
+    local pattern="$3"
+    local rel_pat="$pattern"
+    case "$rel_pat" in
+        "$REPO_ROOT"/*) rel_pat="${rel_pat#$REPO_ROOT/}" ;;
+    esac
+    # Normalize ./ so explicit-segment checks see repo-relative names.
+    rel_pat="$(printf '%s' "$rel_pat" | sed -E 's|^\./||;s|/\./|/|g')"
+
     > "$outfile"
+    # Directory / literal-file inputs: find includes hidden descendants.
+    case "$rel_pat" in
+        *'*'*|*'?'*|*'['*) ;;
+        *)
+            cat "$infile" > "$outfile"
+            return 0
+            ;;
+    esac
+
+    # Explicitly named leading-dot path segments in the caller glob.
+    local explicit_hidden=""
+    local seg
+    local _saved_ifs="$IFS"
+    set -f
+    IFS='/'
+    # shellcheck disable=SC2086
+    set -- $rel_pat
+    IFS="$_saved_ifs"
+    set +f
+    for seg in "$@"; do
+        case "$seg" in
+            .|..|'') continue ;;
+            .*)
+                case "$seg" in
+                    *'*'*|*'?'*|*'['*) ;;
+                    *) explicit_hidden="$explicit_hidden/$seg/" ;;
+                esac
+                ;;
+        esac
+    done
+
     while IFS= read -r rel; do
         [[ -z "$rel" ]] && continue
-        case "/$rel/" in
-            */.*/*|*/.*/) continue ;;
-        esac
-        printf '%s\n' "$rel" >> "$outfile"
+        local keep=1
+        set -f
+        IFS='/'
+        # shellcheck disable=SC2086
+        set -- $rel
+        IFS="$_saved_ifs"
+        set +f
+        for seg in "$@"; do
+            case "$seg" in
+                .|..|'') continue ;;
+                .*)
+                    case "$explicit_hidden" in
+                        */"$seg"/*) ;;
+                        *) keep=0; break ;;
+                    esac
+                    ;;
+            esac
+        done
+        if [ "$keep" -eq 1 ]; then
+            printf '%s\n' "$rel" >> "$outfile"
+        fi
     done < "$infile"
 }
 
@@ -149,7 +207,9 @@ filter_visible_paths() {
 L1_FILE="$WORK/l1_combined.md"
 if [ -d "$KNOWLEDGE_BASE" ]; then
     KB_LIST="$WORK/kb_files.txt"
-    if ! find_sorted "$KB_LIST" find "$KNOWLEDGE_BASE" -type f -name '*.md'; then
+    # -H: dereference a symlink supplied as the knowledge-base pathname
+    # while still not following nested symlinks during the walk.
+    if ! find_sorted "$KB_LIST" find -H "$KNOWLEDGE_BASE" -type f -name '*.md'; then
         echo "error: failed to traverse knowledge base $KNOWLEDGE_BASE" >&2
         exit 2
     fi
@@ -201,13 +261,13 @@ expand_source_glob() {
     fi
 
     case "$pattern" in
-        *\**|*\?*)
-            if ! python3 - "$pattern" "$raw" <<'PY'
+        *\**|*\?*|*\[*)
+            if ! python3 - "$pattern" "$raw" "$LANG_EXT" <<'PY'
 import glob
 import os
 import sys
 
-pattern, out = sys.argv[1], sys.argv[2]
+pattern, out, ext = sys.argv[1], sys.argv[2], sys.argv[3]
 
 
 def literal_prefix(pat: str) -> str:
@@ -233,6 +293,7 @@ def literal_prefix(pat: str) -> str:
 # glob.glob swallows OSError from unreadable directories via _listdir and can
 # report a clean scan while public symbols under those trees were skipped.
 # Probe the literal prefix with os.walk(..., onerror=...) and fail closed.
+# followlinks=True matches glob.glob, which follows symlinked directories.
 root = literal_prefix(pattern)
 errors = []
 
@@ -242,16 +303,24 @@ def on_walk_error(err: OSError) -> None:
 
 
 if os.path.isdir(root):
-    for _dirpath, _dirnames, _filenames in os.walk(root, onerror=on_walk_error):
+    for _dirpath, _dirnames, _filenames in os.walk(
+        root, onerror=on_walk_error, followlinks=True
+    ):
         pass
     if errors:
         for err in errors:
             sys.stderr.write(f"{err}\n")
         sys.exit(1)
 
+ext_suffix = f".{ext}"
 # recursive=True enables ** and preserves intermediate wildcard segments.
+# Restrict to the selected language extension (directory/--changed already do).
 matches = sorted(
-    {p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)}
+    {
+        p
+        for p in glob.glob(pattern, recursive=True)
+        if os.path.isfile(p) and p.endswith(ext_suffix)
+    }
 )
 with open(out, "w", encoding="utf-8") as fh:
     for path in matches:
@@ -283,6 +352,9 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     case "$GLOB_FOR_GIT" in
         "$REPO_ROOT"/*) GLOB_FOR_GIT="${GLOB_FOR_GIT#$REPO_ROOT/}" ;;
     esac
+    # Callers often pass './src/**/*.py'; Git :(glob) needs repo-relative
+    # names without a leading './' or redundant '/./' components.
+    GLOB_FOR_GIT="$(printf '%s' "$GLOB_FOR_GIT" | sed -E 's|^\./||;s|/\./|/|g')"
     PATHSPEC=":(glob)$GLOB_FOR_GIT"
     {
         git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC" 2>/dev/null || true
@@ -291,9 +363,10 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     } | sort -u > "$WORK/changed_raw.txt"
     # grep exits 1 on no matches; with set -e that must not abort before
     # the empty-list success path below. Then drop hidden-component paths so
-    # :(glob) matches full-mode glob (which skips leading-dot names).
+    # :(glob) matches full-mode glob (which skips leading-dot names), while
+    # preserving paths whose leading-dot segments were named explicitly.
     grep -E "\.${LANG_EXT}$" "$WORK/changed_raw.txt" > "$WORK/changed_ext.txt" || true
-    filter_visible_paths "$WORK/changed_ext.txt" "$LIST_OF_FILES"
+    filter_visible_paths "$WORK/changed_ext.txt" "$LIST_OF_FILES" "$SOURCE_GLOB"
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files matching $GLOB_FOR_GIT; nothing to check"
         exit 0

@@ -141,7 +141,78 @@ jobs:
             --changed \
             --source-glob "$REL_HFIX/src/**/*.py" \
             --knowledge-base "$REL_HFIX/docs/api.md")"
-          rm -rf "$HFIX"
           echo "$OUT" | grep -q 'nothing to check'
+          # Explicit leading-dot segment in the glob must still be scanned.
+          mkdir -p "$HFIX/src/.generated"
+          cat > "$HFIX/src/.generated/g.py" <<'PY'
+          class GeneratedSymbol:
+              pass
+          PY
+          if bin/check_drift.sh \
+            --language python \
+            --changed \
+            --source-glob "$REL_HFIX/src/.generated/*.py" \
+            --knowledge-base "$REL_HFIX/docs/api.md"; then
+            rm -rf "$HFIX"
+            echo "expected drift for explicitly named .generated path" >&2
+            exit 1
+          fi
+          # './' prefix must normalize for --changed pathspecs.
+          mkdir -p "$HFIX/src/norm"
+          cat > "$HFIX/src/norm/n.py" <<'PY'
+          class NormSymbol:
+              pass
+          PY
+          echo "NormSymbol" >> "$HFIX/docs/api.md"
+          bin/check_drift.sh \
+            --language python \
+            --changed \
+            --source-glob "./$REL_HFIX/src/norm/*.py" \
+            --knowledge-base "$REL_HFIX/docs/api.md"
+          # Bracket expressions must expand (not treat [ab] as a literal dir).
+          mkdir -p "$HFIX/src/a" "$HFIX/src/b"
+          cat > "$HFIX/src/a/bracket.py" <<'PY'
+          class BracketA:
+              pass
+          PY
+          echo "BracketA" >> "$HFIX/docs/api.md"
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$HFIX/src/[ab]/*.py" \
+            --knowledge-base "$HFIX/docs/api.md"
+          # Wildcard expansion must honor LANG_EXT (ignore .txt templates).
+          cat > "$HFIX/src/norm/template.txt" <<'TXT'
+          class NotPython:
+              pass
+          TXT
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$HFIX/src/norm/**/*" \
+            --knowledge-base "$HFIX/docs/api.md"
+          # Knowledge-base directory symlink must be traversed (-H).
+          ln -s "$HFIX/docs" "$HFIX/docs-link"
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$HFIX/src/norm/*.py" \
+            --knowledge-base "$HFIX/docs-link"
+          # Symlinked source dir under ** must be probed (followlinks).
+          mkdir -p "$HFIX/outside/locked"
+          cat > "$HFIX/outside/locked/via_link.py" <<'PY'
+          class ViaLinkMissing:
+              pass
+          PY
+          chmod 000 "$HFIX/outside/locked"
+          ln -s "$HFIX/outside/locked" "$HFIX/src/norm/via_link"
+          if bin/check_drift.sh \
+            --language python \
+            --source-glob "$HFIX/src/norm/**/*.py" \
+            --knowledge-base "$HFIX/docs/api.md"; then
+            chmod 755 "$HFIX/outside/locked" || true
+            rm -rf "$HFIX"
+            echo "expected fail-closed on unreadable symlink target" >&2
+            exit 1
+          fi
+          chmod 755 "$HFIX/outside/locked" || true
+          rm -rf "$HFIX"
       - name: Skill copies are synchronized
         run: python3 scripts/sync_skills.py --check
