@@ -649,6 +649,53 @@ jobs:
             2>/dev/null || true
           rm -rf Sources/CaffCore docs/knowledge/L1_symlink_target.md \
             docs/knowledge/L1_symlink.md
+
+          # 11) Slashless filename pathspec 'test_*' must not broaden to
+          #     repository-wide *.$ext/**/*.$ext (unrelated files stay unscanned).
+          printf 'def SlashlessGlobProbe():\n    pass\n' > test_slashless.py
+          printf 'def UnrelatedSlashless():\n    pass\n' > unrelated.py
+          git add test_slashless.py unrelated.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'test_*' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'SlashlessGlobProbe'
+          printf '%s\n' "$out" | grep -qv 'UnrelatedSlashless'
+          git reset HEAD -- test_slashless.py unrelated.py 2>/dev/null || true
+          rm -f test_slashless.py unrelated.py
+
+          # 12) Chained staged KB symlinks (kb -> middle -> target) must resolve
+          #     to the final Markdown document before tokenizing.
+          mkdir -p Sources/CaffCore docs/knowledge
+          printf 'public struct ChainKbProbe {}\n' > Sources/CaffCore/ChainKbProbe.swift
+          printf 'ChainKbProbe\n' > docs/knowledge/L1_chain_target.md
+          ln -sf L1_chain_target.md docs/knowledge/L1_chain_middle.md
+          ln -sf L1_chain_middle.md docs/knowledge/L1_chain.md
+          git add Sources/CaffCore/ChainKbProbe.swift \
+            docs/knowledge/L1_chain_target.md docs/knowledge/L1_chain_middle.md \
+            docs/knowledge/L1_chain.md
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base 'docs/knowledge/L1_chain.md' \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- Sources/CaffCore/ChainKbProbe.swift \
+            docs/knowledge/L1_chain_target.md docs/knowledge/L1_chain_middle.md \
+            docs/knowledge/L1_chain.md 2>/dev/null || true
+          rm -rf Sources/CaffCore docs/knowledge/L1_chain_target.md \
+            docs/knowledge/L1_chain_middle.md docs/knowledge/L1_chain.md
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

@@ -269,9 +269,20 @@ case "$SOURCE_GLOB_INPUT" in
         esac
         ;;
     *[\*\?]*|*\[*)
-        # Slashless wildcards such as '*.py' mean the repository root (same as
-        # '$REPO_ROOT/*.py'); keep directory-root pathspec expansion.
-        SRC_DIR_INPUT="."
+        # Slashless wildcards: bare '*.ext' means repository-root directory
+        # expansion (same as '$REPO_ROOT/*.ext' → *.$ext + **/.$ext). Other
+        # slashless filename patterns such as 'test_*' or 'api*.py' must stay
+        # as file pathspecs so an unrelated staged file cannot broaden the
+        # scan to every *.$ext in the repository.
+        case "$SOURCE_GLOB_INPUT" in
+            \*.*)
+                SRC_DIR_INPUT="."
+                ;;
+            *)
+                FILE_PATHSPEC_REPO_REL="$(repo_rel_or_die "$SOURCE_GLOB_INPUT")"
+                SRC_DIR_INPUT="."
+                ;;
+        esac
         ;;
     *.*)
         # Slashless filename such as 'api.py' at the repository root.
@@ -450,21 +461,46 @@ fi
 INDEX_L1_SOURCE=""
 WORKTREE_L1_SOURCE=""
 
-# Read an index (or HEAD) blob, dereferencing in-repo symlink objects so a
-# tracked KB symlink yields the target Markdown content rather than the
-# symlink pathname stored in the blob.
+# Read an index (or HEAD) blob, recursively dereferencing in-repo symlink
+# objects so a tracked KB symlink chain yields the final Markdown content
+# rather than an intermediate symlink pathname stored in a blob. Cycles and
+# absolute targets are refused; hop count is bounded for bash 3.2 safety.
 git_show_blob_deref() {
     local rev_path="$1" dest="$2"
-    local mode="" target="" base_dir="" resolved=""
-    local spec_path="${rev_path#*:}"
+    local mode="" target="" base_dir="" resolved="" current="" show_spec=""
     local rev_prefix="${rev_path%%:*}"
-    if [[ "$rev_prefix" == ":" || "$rev_prefix" == "" ]]; then
-        mode="$(git -C "$REPO_ROOT" ls-files --stage -- "$spec_path" 2>/dev/null | awk '{print $1; exit}')"
-    else
-        mode="$(git -C "$REPO_ROOT" ls-tree "$rev_prefix" -- "$spec_path" 2>/dev/null | awk '{print $1; exit}')"
+    local hop=0
+    local max_hops=32
+    # NUL-delimited visited set (no associative arrays on macOS bash 3.2).
+    local visited=$'\0'
+
+    current="${rev_path#*:}"
+    # ":path" yields rev_prefix="" after %%:*; bare ":path" also works.
+    if [[ "$rev_path" == :* ]]; then
+        rev_prefix=":"
     fi
-    if [[ "$mode" == "120000" ]]; then
-        target="$(git -C "$REPO_ROOT" show "$rev_path" 2>/dev/null || true)"
+
+    while [[ $hop -lt $max_hops ]]; do
+        hop=$((hop + 1))
+        case "$visited" in
+            *$'\0'"$current"$'\0'*) return 1 ;;
+        esac
+        visited="${visited}${current}"$'\0'
+
+        if [[ "$rev_prefix" == ":" || "$rev_prefix" == "" ]]; then
+            mode="$(git -C "$REPO_ROOT" ls-files --stage -- "$current" 2>/dev/null | awk '{print $1; exit}')"
+            show_spec=":$current"
+        else
+            mode="$(git -C "$REPO_ROOT" ls-tree "$rev_prefix" -- "$current" 2>/dev/null | awk '{print $1; exit}')"
+            show_spec="$rev_prefix:$current"
+        fi
+
+        if [[ "$mode" != "120000" ]]; then
+            git -C "$REPO_ROOT" show "$show_spec" > "$dest" 2>/dev/null
+            return $?
+        fi
+
+        target="$(git -C "$REPO_ROOT" show "$show_spec" 2>/dev/null || true)"
         [[ -z "$target" ]] && return 1
         case "$target" in
             /*)
@@ -472,24 +508,18 @@ git_show_blob_deref() {
                 return 1
                 ;;
             *)
-                base_dir="$(dirname "$spec_path")"
+                base_dir="$(dirname "$current")"
                 if [[ "$base_dir" == "." ]]; then
                     resolved="$target"
                 else
                     resolved="$base_dir/$target"
                 fi
                 # Collapse . / .. without leaving the repo spelling git expects.
-                resolved="$(repo_rel_or_die "$REPO_ROOT/$resolved")"
-                if [[ "$rev_prefix" == ":" || "$rev_prefix" == "" ]]; then
-                    git -C "$REPO_ROOT" show ":$resolved" > "$dest" 2>/dev/null
-                else
-                    git -C "$REPO_ROOT" show "$rev_prefix:$resolved" > "$dest" 2>/dev/null
-                fi
-                return $?
+                current="$(repo_rel_or_die "$REPO_ROOT/$resolved")"
                 ;;
         esac
-    fi
-    git -C "$REPO_ROOT" show "$rev_path" > "$dest" 2>/dev/null
+    done
+    return 1
 }
 
 resolve_index_l1() {
