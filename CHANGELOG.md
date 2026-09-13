@@ -25,10 +25,11 @@
   knowledge base as empty instead of falling back to the worktree, and rejects
   relative `--source-glob` values that escape the repository via `..`.
 - `--changed` prefers the worktree when a path has both staged and unstaged
-  edits (so post-stage API additions are not missed); extracted records use
-  NUL-delimited path/symbol pairs so newline-bearing pathnames cannot invent
-  phantom missing symbols; `--staged` no longer requires the source directory
-  to exist in the worktree.
+  edits (so post-stage API additions are not missed), but falls back to the
+  index blob when the worktree copy is gone (staged+deleted / AD) so symbols
+  are not dropped; extracted records use NUL-delimited path/symbol pairs so
+  newline-bearing pathnames cannot invent phantom missing symbols; `--staged`
+  no longer requires the source directory to exist in the worktree.
 
 ## v0.1.0 - 2026-06-23
 

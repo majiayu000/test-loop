@@ -367,9 +367,12 @@ scan_one() {
     # worktree when the same path also has unstaged edits so an API added
     # only after staging is not missed; otherwise use the index blob so a
     # staged-only path still matches commit contents when the worktree diverges.
+    # A staged path deleted only in the worktree (AD) still appears in both
+    # lists — fall back to the index blob so symbols are not dropped.
     if [[ $CHANGED_ONLY -eq 1 ]] && grep -F -z -x -q -- "$rel" "$STAGED_FILES" 2>/dev/null; then
         if [[ $STAGED_ONLY -eq 1 ]] \
-            || ! grep -F -z -x -q -- "$rel" "$WORKTREE_FILES" 2>/dev/null; then
+            || ! grep -F -z -x -q -- "$rel" "$WORKTREE_FILES" 2>/dev/null \
+            || [[ ! -f "$REPO_ROOT/$rel" ]]; then
             git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
                 | append_extracted "$rel" 2>/dev/null || true
             return 0
