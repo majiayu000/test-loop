@@ -19,6 +19,11 @@
   (normalized to `.`), reads the knowledge base from the index blob alongside
   staged sources, and lists paths with `git -z` so C-quoted unusual filenames
   are not dropped before drift scanning.
+- `--staged` scans index-only paths for pre-commit's staged-only contract;
+  `--changed` keeps NUL-delimited path lists end-to-end, uses the worktree
+  knowledge base when scanning unstaged sources, treats an index-deleted
+  knowledge base as empty instead of falling back to the worktree, and rejects
+  relative `--source-glob` values that escape the repository via `..`.
 
 ## v0.1.0 - 2026-06-23
 

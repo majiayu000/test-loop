@@ -90,7 +90,7 @@ jobs:
           printf '\nStagedOnlyProbe\n' >> "$kb"
           set +e
           out=$(bin/check_drift.sh \
-            --changed \
+            --staged \
             --source-glob 'Sources/CaffCore' \
             --knowledge-base "$kb" \
             --language swift 2>&1)
@@ -115,7 +115,83 @@ jobs:
           printf '%s\n' "$out"
           test "$rc" -eq 1
           printf '%s\n' "$out" | grep -q 'CafeProbe'
-      - name: Failure classifier self-test
+      - name: check_drift staged-only, worktree L1, deleted index KB, escape
+        # Codex review follow-ups on e472247.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) --staged ignores an undocumented unstaged sibling file.
+          printf 'public struct StagedOk {}\n' > Sources/CaffCore/StagedOk.swift
+          printf 'public struct UnstagedBad {}\n' > Sources/CaffCore/UnstagedBad.swift
+          git add Sources/CaffCore/StagedOk.swift
+          printf '\nStagedOk\n' >> "$kb"
+          git add "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- "$kb" Sources/CaffCore/StagedOk.swift
+          git checkout -- "$kb"
+          rm -f Sources/CaffCore/StagedOk.swift Sources/CaffCore/UnstagedBad.swift
+
+          # 2) Unstaged API + unstaged L1 docs must compare worktree-to-worktree.
+          printf 'public struct WorktreePair {}\n' > Sources/CaffCore/WorktreePair.swift
+          printf '\nWorktreePair\n' >> "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git checkout -- "$kb"
+          rm -f Sources/CaffCore/WorktreePair.swift
+
+          # 3) Index-deleted KB must not fall back to a worktree recreation.
+          printf 'public struct DeletedKbProbe {}\n' > Sources/CaffCore/DeletedKbProbe.swift
+          git add Sources/CaffCore/DeletedKbProbe.swift
+          git rm --cached -f "$kb"
+          printf '\nDeletedKbProbe\n' > "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DeletedKbProbe'
+          git checkout HEAD -- "$kb"
+          git reset HEAD -- Sources/CaffCore/DeletedKbProbe.swift 2>/dev/null || true
+          rm -f Sources/CaffCore/DeletedKbProbe.swift
+
+          # 4) Relative ../ source-glob escape must exit 2 (not silent clean).
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob '../shared/src' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 2
+          printf '%s\n' "$out" | grep -qi 'inside the repository'
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
         run: python3 scripts/sync_skills.py --check

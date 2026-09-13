@@ -8,7 +8,7 @@
 # Skip with:
 #   git commit --no-verify
 #
-# Re-runs bin/check_drift.sh --changed against the staged CaffCore files
+# Re-runs bin/check_drift.sh --staged against the staged CaffCore files
 # only, so unrelated commits (e.g. docs/ changes) are not affected.
 
 set -e
@@ -27,8 +27,8 @@ if [[ -z "$STAGED_SOURCES" ]]; then
     exit 0
 fi
 
-echo "pre-commit: running bin/check_drift.sh --changed on staged CaffCore files"
-if bash "$DRIFT_SCRIPT" --changed; then
+echo "pre-commit: running bin/check_drift.sh --staged on staged CaffCore files"
+if bash "$DRIFT_SCRIPT" --staged; then
     exit 0
 fi
 

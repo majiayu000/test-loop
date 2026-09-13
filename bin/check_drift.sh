@@ -6,6 +6,7 @@
 #   bin/check_drift.sh                                # caff defaults: Sources/CaffCore + L1_modules.md
 #   bin/check_drift.sh --source-glob 'src/**/*.py' --knowledge-base docs/knowledge
 #   bin/check_drift.sh --language python --changed
+#   bin/check_drift.sh --language python --staged   # index-only (pre-commit)
 #   bin/check_drift.sh --language auto               # auto-detect from manifest
 #
 # Supported languages: swift (default), python, go, rust, auto.
@@ -20,6 +21,8 @@
 #     compatible.
 #   - Coarse regex per language (see LANGUAGE_PATTERNS below). L1 documents
 #     public API at the type level, so coarse is sufficient for drift.
+#   - --changed scans staged + unstaged + untracked sources (worktree view).
+#   - --staged scans only the index (for pre-commit's staged-only contract).
 
 set -e
 
@@ -32,18 +35,20 @@ SOURCE_GLOB="Sources/CaffCore"
 KNOWLEDGE_BASE="docs/knowledge/L1_modules.md"
 LANGUAGE="swift"
 CHANGED_ONLY=0
+STAGED_ONLY=0
 
 while [ $# -gt 0 ]; do
     arg="$1"
     case "$arg" in
         --changed) CHANGED_ONLY=1; shift ;;
+        --staged)  STAGED_ONLY=1; CHANGED_ONLY=1; shift ;;
         --source-glob)        SOURCE_GLOB="${2:-}"; shift 2 ;;
         --source-glob=*)      SOURCE_GLOB="${arg#--source-glob=}"; shift ;;
         --knowledge-base)     KNOWLEDGE_BASE="${2:-}"; shift 2 ;;
         --knowledge-base=*)   KNOWLEDGE_BASE="${arg#--knowledge-base=}"; shift ;;
         --language)           LANGUAGE="${2:-}"; shift 2 ;;
         --language=*)         LANGUAGE="${arg#--language=}"; shift ;;
-        -h|--help) sed -n '3,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,22p' "$0"; exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -74,14 +79,6 @@ if [ "$LANGUAGE" = "auto" ]; then
     fi
 fi
 
-# Pick the source directory for --changed: the first directory segment of
-# the glob, or a known default for caff compatibility.
-SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*[^/]*$||;s|/\*\*$||')"
-if [ ! -d "$SRC_DIR" ]; then
-    echo "error: $SRC_DIR not found" >&2
-    exit 2
-fi
-
 # Resolve knowledge-base path relative to the repo (for index lookups).
 L1_REL="$KNOWLEDGE_BASE"
 case "$L1_REL" in
@@ -105,16 +102,77 @@ case "$LANGUAGE" in
         ;;
 esac
 
+# Lexically normalize a path (absolute or repo-relative) and ensure it stays
+# inside REPO_ROOT. Prints a repo-relative path (or ".") on success.
+repo_rel_or_die() {
+    local raw="$1"
+    local abs
+    case "$raw" in
+        /*) abs="$raw" ;;
+        *)  abs="$REPO_ROOT/$raw" ;;
+    esac
+    # Collapse . and .. without resolving symlinks (bash 3.2 / macOS).
+    local normalized="" part
+    local IFS='/'
+    # shellcheck disable=SC2086
+    set -- $abs
+    unset IFS
+    for part in "$@"; do
+        case "$part" in
+            ""|.) continue ;;
+            ..)
+                if [[ -z "$normalized" || "$normalized" == "/" ]]; then
+                    echo "error: --source-glob must be inside the repository ($raw)" >&2
+                    exit 2
+                fi
+                normalized="${normalized%/*}"
+                [[ -z "$normalized" ]] && normalized="/"
+                ;;
+            *)
+                if [[ -z "$normalized" || "$normalized" == "/" ]]; then
+                    normalized="/$part"
+                else
+                    normalized="$normalized/$part"
+                fi
+                ;;
+        esac
+    done
+    [[ -z "$normalized" ]] && normalized="/"
+    case "$normalized" in
+        "$REPO_ROOT") printf '%s\n' "." ;;
+        "$REPO_ROOT"/*) printf '%s\n' "${normalized#"$REPO_ROOT"/}" ;;
+        *)
+            echo "error: --source-glob must be inside the repository ($raw)" >&2
+            exit 2
+            ;;
+    esac
+}
+
+# Reject relative/absolute source globs that escape the repository before any
+# git pathspec work (including cases where the outside directory exists).
+SRC_DIR_INPUT="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
+SRC_DIR_REPO_REL="$(repo_rel_or_die "$SRC_DIR_INPUT")"
+
+# Pick the source directory for filesystem checks / full-mode find.
+SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*[^/]*$||;s|/\*\*$||')"
+if [ ! -d "$SRC_DIR" ]; then
+    echo "error: $SRC_DIR not found" >&2
+    exit 2
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 EXTRACTED="$WORK/extracted.txt"
 LIST_OF_FILES="$WORK/files.txt"
 STAGED_FILES="$WORK/staged.txt"
+WORKTREE_FILES="$WORK/worktree_changed.txt"
 > "$EXTRACTED"
 > "$LIST_OF_FILES"
 > "$STAGED_FILES"
+> "$WORKTREE_FILES"
 
 # Filter NUL-terminated git pathnames, keeping only those with LANG_EXT.
+# Preserve NUL delimiters end-to-end so embedded newlines cannot split paths.
 # Line-oriented git output may C-quote unusual names (ending in .ext"), which
 # silently drops them from extension filters.
 filter_paths_z() {
@@ -122,37 +180,21 @@ filter_paths_z() {
     while IFS= read -r -d '' path; do
         [[ -z "$path" ]] && continue
         case "$path" in
-            *."$ext") printf '%s\n' "$path" ;;
+            *."$ext") printf '%s\0' "$path" ;;
         esac
     done
 }
 
-# Decide which files to scan, in --changed mode or full mode.
+# Decide which files to scan, in --changed/--staged mode or full mode.
 if [[ $CHANGED_ONLY -eq 1 ]]; then
     if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-        echo "error: --changed requires a git repo" >&2
-        exit 2
-    fi
-    if [[ ! -f "$L1_FILE" ]] && ! git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
-        echo "error: $L1_FILE not found" >&2
+        echo "error: --changed/--staged requires a git repo" >&2
         exit 2
     fi
     # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build repo-relative
     # git pathspecs: absolute pathspecs do not match, and ** alone omits files
     # directly under the source directory.
-    SRC_DIR_FOR_GIT="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
-    case "$SRC_DIR_FOR_GIT" in
-        /*)
-            case "$SRC_DIR_FOR_GIT" in
-                "$REPO_ROOT") SRC_DIR_FOR_GIT="." ;;
-                "$REPO_ROOT"/*) SRC_DIR_FOR_GIT="${SRC_DIR_FOR_GIT#"$REPO_ROOT"/}" ;;
-                *)
-                    echo "error: --source-glob must be inside the repository ($SRC_DIR_FOR_GIT)" >&2
-                    exit 2
-                    ;;
-            esac
-            ;;
-    esac
+    SRC_DIR_FOR_GIT="$SRC_DIR_REPO_REL"
     if [[ -z "$SRC_DIR_FOR_GIT" || "$SRC_DIR_FOR_GIT" == "." ]]; then
         PATHSPEC_DIRECT="*.${LANG_EXT}"
         PATHSPEC_NESTED="**/*.${LANG_EXT}"
@@ -163,12 +205,16 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     fi
     {
         git -C "$REPO_ROOT" diff --cached -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-    } | filter_paths_z "$LANG_EXT" | sort -u > "$STAGED_FILES" || true
-    {
-        git -C "$REPO_ROOT" diff -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-        git -C "$REPO_ROOT" ls-files -z --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-    } | filter_paths_z "$LANG_EXT" | sort -u > "$WORK/worktree_changed.txt" || true
-    cat "$STAGED_FILES" "$WORK/worktree_changed.txt" | sort -u > "$LIST_OF_FILES"
+    } | filter_paths_z "$LANG_EXT" | sort -z -u > "$STAGED_FILES" || true
+    if [[ $STAGED_ONLY -eq 1 ]]; then
+        cp "$STAGED_FILES" "$LIST_OF_FILES"
+    else
+        {
+            git -C "$REPO_ROOT" diff -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+            git -C "$REPO_ROOT" ls-files -z --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
+        } | filter_paths_z "$LANG_EXT" | sort -z -u > "$WORKTREE_FILES" || true
+        cat "$STAGED_FILES" "$WORKTREE_FILES" | sort -z -u > "$LIST_OF_FILES"
+    fi
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
         exit 0
@@ -191,11 +237,44 @@ else
     fi
 fi
 
-# Prefer the index blob for --changed so both sides describe the commit.
+# Choose the knowledge-base snapshot to match the sources being scanned.
+# - Index-only / staged-only scans: use the index blob. If the KB exists in
+#   HEAD but was deleted from the index, treat it as empty (do not fall back
+#   to a worktree recreation).
+# - Worktree changes present under --changed: use the worktree KB so unstaged
+#   API + docs edits are compared together.
 L1_SOURCE="$L1_FILE"
-if [[ $CHANGED_ONLY -eq 1 ]] && git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
-    git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_blob.md"
-    L1_SOURCE="$WORK/l1_blob.md"
+if [[ $CHANGED_ONLY -eq 1 ]]; then
+    use_index_l1=0
+    if [[ $STAGED_ONLY -eq 1 ]]; then
+        use_index_l1=1
+    elif [[ -s "$STAGED_FILES" && ! -s "$WORKTREE_FILES" ]]; then
+        use_index_l1=1
+    fi
+    if [[ $use_index_l1 -eq 1 ]]; then
+        if git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
+            git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_blob.md"
+            L1_SOURCE="$WORK/l1_blob.md"
+        elif git -C "$REPO_ROOT" cat-file -e "HEAD:$L1_REL" 2>/dev/null; then
+            # Tracked in HEAD but removed from the index (e.g. git rm --cached).
+            : > "$WORK/l1_blob.md"
+            L1_SOURCE="$WORK/l1_blob.md"
+        elif [[ ! -f "$L1_FILE" ]]; then
+            echo "error: $L1_FILE not found" >&2
+            exit 2
+        fi
+    else
+        # Worktree (or mixed) scan: prefer the worktree knowledge base.
+        if [[ ! -f "$L1_FILE" ]]; then
+            if git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
+                git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_blob.md"
+                L1_SOURCE="$WORK/l1_blob.md"
+            else
+                echo "error: $L1_FILE not found" >&2
+                exit 2
+            fi
+        fi
+    fi
 fi
 
 # Per-language awk rules. Each rule prints "<rel_path>:<Name>".
@@ -264,19 +343,32 @@ emit_awk() {
     esac
 }
 
-while IFS= read -r rel; do
-    [[ -z "$rel" ]] && continue
-    # Staged paths are scanned from the index blob so --changed matches what
-    # pre-commit will commit, even when the worktree diverges.
-    if [[ $CHANGED_ONLY -eq 1 ]] && grep -Fxq -- "$rel" "$STAGED_FILES" 2>/dev/null; then
+scan_one() {
+    local rel="$1"
+    [[ -z "$rel" ]] && return 0
+    # Staged paths are scanned from the index blob so --changed/--staged
+    # match what pre-commit will commit, even when the worktree diverges.
+    if [[ $CHANGED_ONLY -eq 1 ]] && grep -F -z -x -q -- "$rel" "$STAGED_FILES" 2>/dev/null; then
         git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
             | emit_awk "$rel" >> "$EXTRACTED" 2>/dev/null || true
-        continue
+        return 0
     fi
     f="$REPO_ROOT/$rel"
-    [[ -f "$f" ]] || continue
+    [[ -f "$f" ]] || return 0
     emit_awk "$rel" < "$f" >> "$EXTRACTED" 2>/dev/null || true
-done < "$LIST_OF_FILES"
+}
+
+if [[ $CHANGED_ONLY -eq 1 ]]; then
+    while IFS= read -r -d '' rel; do
+        scan_one "$rel"
+    done < "$LIST_OF_FILES"
+    FILE_COUNT=$(tr -cd '\0' < "$LIST_OF_FILES" | wc -c | tr -d ' ')
+else
+    while IFS= read -r rel; do
+        scan_one "$rel"
+    done < "$LIST_OF_FILES"
+    FILE_COUNT=$(wc -l < "$LIST_OF_FILES" | tr -d ' ')
+fi
 
 # Sorted unique names extracted from sources.
 EXTRACTED_NAMES="$WORK/names.txt"
@@ -330,7 +422,7 @@ comm -23 "$EXTRACTED_NAMES" "$KNOWN" > "$MISSING"
 TOTAL=$(wc -l < "$EXTRACTED_NAMES" | tr -d ' ')
 NUM_MISSING=$(wc -l < "$MISSING" | tr -d ' ')
 
-echo "scanned $TOTAL public symbol(s) across $(wc -l < "$LIST_OF_FILES" | tr -d ' ') file(s)"
+echo "scanned $TOTAL public symbol(s) across $FILE_COUNT file(s)"
 
 if [[ "$NUM_MISSING" -eq 0 ]]; then
     echo "drift: clean ✅"
