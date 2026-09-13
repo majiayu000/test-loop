@@ -22,7 +22,8 @@
 #   - Coarse regex per language (see LANGUAGE_PATTERNS below). L1 documents
 #     public API at the type level, so coarse is sufficient for drift.
 #   - --changed scans staged + unstaged + untracked sources (unioning both
-#     snapshots when a path differs in the index and the worktree).
+#     snapshots when a path differs in the index and the worktree), comparing
+#     index symbols to the index KB and worktree symbols to the worktree KB.
 #   - --staged scans only the index (for pre-commit's staged-only contract).
 
 set -e
@@ -68,12 +69,25 @@ case "$KNOWLEDGE_BASE" in
 esac
 L1_FILE="$KNOWLEDGE_BASE"
 
-# Auto-detect language from a project manifest.
+# Auto-detect language from a project manifest. In --staged mode, also accept
+# manifests that exist only in the index (worktree copy may be absent).
+manifest_present() {
+    local name="$1"
+    if [ -f "$REPO_ROOT/$name" ]; then
+        return 0
+    fi
+    if [[ $STAGED_ONLY -eq 1 ]] \
+        && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+        && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
 if [ "$LANGUAGE" = "auto" ]; then
-    if [ -f "$REPO_ROOT/Package.swift" ]; then LANGUAGE="swift"
-    elif [ -f "$REPO_ROOT/pyproject.toml" ]; then LANGUAGE="python"
-    elif [ -f "$REPO_ROOT/go.mod" ]; then LANGUAGE="go"
-    elif [ -f "$REPO_ROOT/Cargo.toml" ]; then LANGUAGE="rust"
+    if manifest_present "Package.swift"; then LANGUAGE="swift"
+    elif manifest_present "pyproject.toml"; then LANGUAGE="python"
+    elif manifest_present "go.mod"; then LANGUAGE="go"
+    elif manifest_present "Cargo.toml"; then LANGUAGE="rust"
     else
         echo "error: --language auto could not find Package.swift / pyproject.toml / go.mod / Cargo.toml" >&2
         exit 2
@@ -162,24 +176,29 @@ esac
 SRC_DIR_REPO_REL="$(repo_rel_or_die "$SRC_DIR_INPUT")"
 
 # Pick the source directory for filesystem checks / full-mode find.
-# Index-only (--staged) scans do not require the worktree directory: the last
-# source file may be staged for deletion, or a newly staged tree may be removed
-# locally before commit.
+# Changed/staged scans do not require the worktree directory: staged blobs may
+# still exist after the last source file is deleted or a newly staged tree is
+# removed locally before commit.
 SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*[^/]*$||;s|/\*\*$||')"
-if [[ $STAGED_ONLY -ne 1 ]] && [ ! -d "$SRC_DIR" ]; then
+if [[ $CHANGED_ONLY -ne 1 ]] && [ ! -d "$SRC_DIR" ]; then
     echo "error: $SRC_DIR not found" >&2
     exit 2
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-# EXTRACTED stores NUL-delimited path/symbol pairs (path\0symbol\0...) so a
+# EXTRACTED_* store NUL-delimited path/symbol pairs (path\0symbol\0...) so a
 # pathname containing a newline cannot split records the way path:symbol lines
-# would.
+# would. Staged and worktree origins are kept separate so each set can be
+# validated against the matching knowledge-base snapshot.
+EXTRACTED_STAGED="$WORK/extracted_staged.txt"
+EXTRACTED_WORKTREE="$WORK/extracted_worktree.txt"
 EXTRACTED="$WORK/extracted.txt"
 LIST_OF_FILES="$WORK/files.txt"
 STAGED_FILES="$WORK/staged.txt"
 WORKTREE_FILES="$WORK/worktree_changed.txt"
+> "$EXTRACTED_STAGED"
+> "$EXTRACTED_WORKTREE"
 > "$EXTRACTED"
 > "$LIST_OF_FILES"
 > "$STAGED_FILES"
@@ -263,50 +282,42 @@ else
     fi
 fi
 
-# Choose the knowledge-base snapshot to match the sources being scanned.
-# - Index-only / staged-only scans: use the index blob. If the KB exists in
-#   HEAD but was deleted from the index, treat it as empty (do not fall back
-#   to a worktree recreation).
-# - Worktree changes present under --changed: use the worktree KB so unstaged
-#   API + docs edits are compared together.
-L1_SOURCE="$L1_FILE"
-if [[ $CHANGED_ONLY -eq 1 ]]; then
-    use_index_l1=0
-    if [[ $STAGED_ONLY -eq 1 ]]; then
-        use_index_l1=1
-    elif [[ -s "$STAGED_FILES" && ! -s "$WORKTREE_FILES" ]]; then
-        use_index_l1=1
-    fi
-    if [[ $use_index_l1 -eq 1 ]]; then
-        if git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
-            git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_blob.md"
-            L1_SOURCE="$WORK/l1_blob.md"
-        elif git -C "$REPO_ROOT" cat-file -e "HEAD:$L1_REL" 2>/dev/null; then
-            # Tracked in HEAD but removed from the index (e.g. git rm --cached).
-            : > "$WORK/l1_blob.md"
-            L1_SOURCE="$WORK/l1_blob.md"
-        elif [[ $STAGED_ONLY -eq 1 ]]; then
-            # Index-only scan: never fall back to a worktree-only KB (e.g.
-            # initial commit staging sources but not the knowledge base).
-            : > "$WORK/l1_blob.md"
-            L1_SOURCE="$WORK/l1_blob.md"
-        elif [[ ! -f "$L1_FILE" ]]; then
-            echo "error: $L1_FILE not found" >&2
-            exit 2
-        fi
+# Resolve knowledge-base snapshots for staged vs worktree symbol sets.
+# - Index/staged symbols: use the index blob. If the KB exists in HEAD but was
+#   deleted from the index, treat it as empty (do not fall back to a worktree
+#   recreation). Index-only scans never fall back to a worktree-only KB.
+# - Worktree symbols: prefer the worktree file; fall back to the index blob
+#   only when the worktree file is missing.
+INDEX_L1_SOURCE=""
+WORKTREE_L1_SOURCE=""
+
+resolve_index_l1() {
+    if git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
+        git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_index.md"
+        INDEX_L1_SOURCE="$WORK/l1_index.md"
+    elif git -C "$REPO_ROOT" cat-file -e "HEAD:$L1_REL" 2>/dev/null; then
+        # Tracked in HEAD but removed from the index (e.g. git rm --cached).
+        : > "$WORK/l1_index.md"
+        INDEX_L1_SOURCE="$WORK/l1_index.md"
     else
-        # Worktree (or mixed) scan: prefer the worktree knowledge base.
-        if [[ ! -f "$L1_FILE" ]]; then
-            if git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
-                git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_blob.md"
-                L1_SOURCE="$WORK/l1_blob.md"
-            else
-                echo "error: $L1_FILE not found" >&2
-                exit 2
-            fi
-        fi
+        # Missing from index/HEAD: treat as empty for staged/index comparisons
+        # (never fall back to a worktree-only KB).
+        : > "$WORK/l1_index.md"
+        INDEX_L1_SOURCE="$WORK/l1_index.md"
     fi
-fi
+}
+
+resolve_worktree_l1() {
+    if [[ -f "$L1_FILE" ]]; then
+        WORKTREE_L1_SOURCE="$L1_FILE"
+    elif git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
+        git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_worktree.md"
+        WORKTREE_L1_SOURCE="$WORK/l1_worktree.md"
+    else
+        echo "error: $L1_FILE not found" >&2
+        exit 2
+    fi
+}
 
 # Per-language awk rules. Each rule prints one symbol name per line.
 # The caller pairs names with the source path via NUL-delimited EXTRACTED
@@ -376,12 +387,12 @@ emit_awk() {
     esac
 }
 
-# Append path/symbol pairs from stdin source text into EXTRACTED.
+# Append path/symbol pairs from stdin source text into the given EXTRACTED file.
 append_extracted() {
-    local rel="$1" name
+    local rel="$1" out="$2" name
     emit_awk | while IFS= read -r name; do
         [[ -z "$name" ]] && continue
-        printf '%s\0%s\0' "$rel" "$name" >> "$EXTRACTED"
+        printf '%s\0%s\0' "$rel" "$name" >> "$out"
     done
 }
 
@@ -394,32 +405,33 @@ scan_one() {
     # preferring only the worktree misses APIs that exist solely in the index
     # (e.g. staged new definition + worktree restored to HEAD), while preferring
     # only the index misses post-stage worktree additions. A staged path deleted
-    # only in the worktree (AD) still contributes the index blob.
+    # only in the worktree (AD) still contributes the index blob. Origins are
+    # recorded separately so each set is checked against its matching KB.
     if [[ $CHANGED_ONLY -eq 1 ]]; then
         path_in_z_list "$rel" "$STAGED_FILES" && in_staged=1
         path_in_z_list "$rel" "$WORKTREE_FILES" && in_worktree=1
     fi
     if [[ $STAGED_ONLY -eq 1 ]]; then
         git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | append_extracted "$rel" 2>/dev/null || true
+            | append_extracted "$rel" "$EXTRACTED_STAGED" 2>/dev/null || true
         return 0
     fi
     if [[ $CHANGED_ONLY -eq 1 && $in_staged -eq 1 && $in_worktree -eq 1 ]]; then
         git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | append_extracted "$rel" 2>/dev/null || true
+            | append_extracted "$rel" "$EXTRACTED_STAGED" 2>/dev/null || true
         if [[ -f "$REPO_ROOT/$rel" ]]; then
-            append_extracted "$rel" < "$REPO_ROOT/$rel" 2>/dev/null || true
+            append_extracted "$rel" "$EXTRACTED_WORKTREE" < "$REPO_ROOT/$rel" 2>/dev/null || true
         fi
         return 0
     fi
     if [[ $CHANGED_ONLY -eq 1 && $in_staged -eq 1 ]]; then
         git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | append_extracted "$rel" 2>/dev/null || true
+            | append_extracted "$rel" "$EXTRACTED_STAGED" 2>/dev/null || true
         return 0
     fi
     f="$REPO_ROOT/$rel"
     [[ -f "$f" ]] || return 0
-    append_extracted "$rel" < "$f" 2>/dev/null || true
+    append_extracted "$rel" "$EXTRACTED_WORKTREE" < "$f" 2>/dev/null || true
 }
 
 if [[ $CHANGED_ONLY -eq 1 ]]; then
@@ -434,23 +446,38 @@ else
     FILE_COUNT=$(wc -l < "$LIST_OF_FILES" | tr -d ' ')
 fi
 
-# Sorted unique names extracted from sources (NUL path/symbol pairs).
-EXTRACTED_NAMES="$WORK/names.txt"
-: > "$EXTRACTED_NAMES"
-{
-    while true; do
-        IFS= read -r -d '' _rel || break
-        IFS= read -r -d '' name || break
-        [[ -z "$name" ]] && continue
-        printf '%s\n' "$name"
-    done < "$EXTRACTED"
-} | sort -u > "$EXTRACTED_NAMES"
+# Merge origin-specific extractions for reporting path:symbol pairs.
+cat "$EXTRACTED_STAGED" "$EXTRACTED_WORKTREE" > "$EXTRACTED"
 
-# Sorted unique identifiers appearing in L1 (strip code fences and backticks first).
-L1_NAMES="$WORK/l1_names.txt"
-sed -E 's/```[^`]*```//g' "$L1_SOURCE" \
-    | tr -cs 'A-Za-z0-9_' '\n' \
-    | sort -u > "$L1_NAMES"
+# Sorted unique names extracted from a NUL path/symbol pair file.
+names_from_extracted() {
+    local src="$1" dest="$2"
+    : > "$dest"
+    [[ -s "$src" ]] || return 0
+    {
+        while true; do
+            IFS= read -r -d '' _rel || break
+            IFS= read -r -d '' name || break
+            [[ -z "$name" ]] && continue
+            printf '%s\n' "$name"
+        done < "$src"
+    } | sort -u > "$dest"
+}
+
+# Missing = extracted names minus (L1 names ∪ baseline).
+compute_missing_against_l1() {
+    local extracted_file="$1" l1_source="$2" missing_out="$3"
+    local names_file l1_names known
+    names_file="$WORK/names_$(basename "$missing_out").txt"
+    l1_names="$WORK/l1_names_$(basename "$missing_out").txt"
+    known="$WORK/known_$(basename "$missing_out").txt"
+    names_from_extracted "$extracted_file" "$names_file"
+    sed -E 's/```[^`]*```//g' "$l1_source" \
+        | tr -cs 'A-Za-z0-9_' '\n' \
+        | sort -u > "$l1_names"
+    cat "$l1_names" "$BASELINE_NAMES" | sort -u > "$known"
+    comm -23 "$names_file" "$known" > "$missing_out"
+}
 
 # Baseline: symbols that are deliberately undocumented in L1 (e.g., trivial
 # accessors the regex catches but the L1 table doesn't enumerate by name).
@@ -483,13 +510,49 @@ WakeSession
 BASELINE_NAMES="$WORK/baseline_names.txt"
 printf '%s' "$L1_BASELINE_RAW" | tr -d ' ' | grep -E '^[A-Z][A-Za-z0-9_]+$' | sort -u > "$BASELINE_NAMES"
 
-# Known = (L1 names) union (baseline names).
-KNOWN="$WORK/known.txt"
-cat "$L1_NAMES" "$BASELINE_NAMES" | sort -u > "$KNOWN"
-
-# Missing = extracted names minus known.
 MISSING="$WORK/missing.txt"
-comm -23 "$EXTRACTED_NAMES" "$KNOWN" > "$MISSING"
+: > "$MISSING"
+EXTRACTED_NAMES="$WORK/names.txt"
+: > "$EXTRACTED_NAMES"
+
+# Compare each origin's symbols against the matching KB snapshot. Combining
+# both symbol sets with a single worktree KB falsely cleans staged-only APIs
+# that were documented only in an unstaged knowledge-base edit.
+need_index_compare=0
+need_worktree_compare=0
+if [[ $STAGED_ONLY -eq 1 ]]; then
+    need_index_compare=1
+elif [[ $CHANGED_ONLY -eq 1 ]]; then
+    [[ -s "$EXTRACTED_STAGED" ]] && need_index_compare=1
+    [[ -s "$EXTRACTED_WORKTREE" ]] && need_worktree_compare=1
+    # Path listed but extraction empty (e.g. deleted worktree file): still
+    # honor the corresponding KB side when that file list is non-empty and the
+    # other side already triggered a compare, or when only one side has paths.
+    if [[ $need_index_compare -eq 0 && $need_worktree_compare -eq 0 ]]; then
+        [[ -s "$STAGED_FILES" ]] && need_index_compare=1
+        [[ -s "$WORKTREE_FILES" ]] && need_worktree_compare=1
+    fi
+else
+    need_worktree_compare=1
+fi
+
+if [[ $need_index_compare -eq 1 ]]; then
+    resolve_index_l1
+    compute_missing_against_l1 "$EXTRACTED_STAGED" "$INDEX_L1_SOURCE" "$WORK/missing_staged.txt"
+    names_from_extracted "$EXTRACTED_STAGED" "$WORK/names_staged.txt"
+    cat "$WORK/names_staged.txt" >> "$EXTRACTED_NAMES"
+    cat "$WORK/missing_staged.txt" >> "$MISSING"
+fi
+if [[ $need_worktree_compare -eq 1 ]]; then
+    resolve_worktree_l1
+    compute_missing_against_l1 "$EXTRACTED_WORKTREE" "$WORKTREE_L1_SOURCE" "$WORK/missing_worktree.txt"
+    names_from_extracted "$EXTRACTED_WORKTREE" "$WORK/names_worktree.txt"
+    cat "$WORK/names_worktree.txt" >> "$EXTRACTED_NAMES"
+    cat "$WORK/missing_worktree.txt" >> "$MISSING"
+fi
+
+sort -u "$EXTRACTED_NAMES" -o "$EXTRACTED_NAMES"
+sort -u "$MISSING" -o "$MISSING"
 
 TOTAL=$(wc -l < "$EXTRACTED_NAMES" | tr -d ' ')
 NUM_MISSING=$(wc -l < "$MISSING" | tr -d ' ')

@@ -35,6 +35,11 @@
   rather than falling back to the uncommitted file; slashless
   `--source-glob '*.ext'` is normalized to the repository root like
   `$REPO_ROOT/*.ext`.
+- `--changed` compares index symbols to the index knowledge base and worktree
+  symbols to the worktree knowledge base (so documenting a staged-only API only
+  in an unstaged KB no longer falsely cleans); `--changed` also scans when the
+  worktree source directory is absent if staged blobs remain; `--staged
+  --language auto` detects language from index-only manifests.
 
 ## v0.1.0 - 2026-06-23
 

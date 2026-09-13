@@ -351,6 +351,75 @@ jobs:
           printf '%s\n' "$out" | grep -q 'MembershipProbe'
           git reset HEAD -- Sources/CaffCore/MembershipProbe.swift 2>/dev/null || true
           rm -rf Sources/CaffCore
+      - name: check_drift dual KB, changed without dir, staged auto lang
+        # Codex review follow-ups on 22c0a90: pair each origin with its KB,
+        # allow --changed when the worktree source dir is gone, and resolve
+        # --staged --language auto from index-only manifests.
+        run: |
+          set -euo pipefail
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged undocumented API + worktree restored + name only in
+          #    unstaged KB must still report drift (index symbols vs index KB).
+          mkdir -p Sources/CaffCore
+          printf 'public struct DualKbBase {}\npublic struct DualKbStaged {}\n' > Sources/CaffCore/DualKb.swift
+          git add Sources/CaffCore/DualKb.swift
+          printf 'public struct DualKbBase {}\n' > Sources/CaffCore/DualKb.swift
+          printf '\nDualKbStaged\n' >> "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DualKbStaged'
+          git checkout -- "$kb"
+          git reset HEAD -- Sources/CaffCore/DualKb.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 2) --changed must scan staged blobs when the source dir is gone.
+          mkdir -p Sources/CaffCore
+          printf 'public struct ChangedGoneDir {}\n' > Sources/CaffCore/ChangedGoneDir.swift
+          git add Sources/CaffCore/ChangedGoneDir.swift
+          rm -rf Sources/CaffCore
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'ChangedGoneDir'
+          git reset HEAD -- Sources/CaffCore/ChangedGoneDir.swift 2>/dev/null || true
+
+          # 3) --staged --language auto must see an index-only pyproject.toml.
+          mkdir -p src
+          printf '[project]\nname = "tmp"\n' > pyproject.toml
+          printf 'def AutoLangProbe():\n    pass\n' > src/a.py
+          git add pyproject.toml src/a.py
+          rm -f pyproject.toml
+          rm -rf src
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'AutoLangProbe'
+          git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
+          rm -f pyproject.toml
+          rm -rf src
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
