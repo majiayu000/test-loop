@@ -201,9 +201,10 @@ jobs:
           printf '%s\n' "$out" | grep -qi 'inside the repository'
           rm -rf Sources/CaffCore
       - name: check_drift mixed worktree, NUL EXTRACTED, staged without dir
-        # Codex review follow-ups on 99b7c23: doubly-changed paths prefer the
-        # worktree under --changed; EXTRACTED stays NUL-safe for newline paths;
-        # --staged does not require the source directory in the worktree.
+        # Codex review follow-ups on 99b7c23: doubly-changed paths union index
+        # and worktree symbols under --changed; EXTRACTED stays NUL-safe for
+        # newline paths; --staged does not require the source directory in the
+        # worktree.
         run: |
           set -euo pipefail
           mkdir -p Sources/CaffCore
@@ -266,6 +267,90 @@ jobs:
           test "$rc" -eq 1
           printf '%s\n' "$out" | grep -q 'GoneDirProbe'
           git reset HEAD -- Sources/CaffCore/GoneDirProbe.swift 2>/dev/null || true
+      - name: check_drift portable membership, slashless glob, staged KB, union
+        # Codex review follow-ups on 408e254: portable NUL membership (no
+        # grep -z), slashless root --source-glob, refuse worktree-only KB in
+        # --staged, and union both snapshots for doubly-changed paths.
+        run: |
+          set -euo pipefail
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Slashless root glob '*.py' must scan repo-root python paths.
+          printf 'def RootGlobProbe():\n    pass\n' > RootGlobProbe.py
+          git add RootGlobProbe.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob '*.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'RootGlobProbe'
+          printf '%s\n' "$out" | grep -qv 'under \*\.py'
+          git reset HEAD -- RootGlobProbe.py 2>/dev/null || true
+          rm -f RootGlobProbe.py
+
+          # 2) --staged must not treat a worktree-only KB as documenting APIs.
+          mkdir -p Sources/CaffCore
+          printf 'public struct WorktreeKbProbe {}\n' > Sources/CaffCore/WorktreeKbProbe.swift
+          git add Sources/CaffCore/WorktreeKbProbe.swift
+          WORK_KB=$(mktemp)
+          printf '# worktree-only KB\n\nWorktreeKbProbe\n' > "$WORK_KB"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$WORK_KB" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'WorktreeKbProbe'
+          rm -f "$WORK_KB"
+          git reset HEAD -- Sources/CaffCore/WorktreeKbProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 3) Doubly-changed path: staged undocumented API + worktree without it.
+          mkdir -p Sources/CaffCore
+          printf 'public struct UnionBase {}\npublic struct UnionStagedOnly {}\n' > Sources/CaffCore/Union.swift
+          git add Sources/CaffCore/Union.swift
+          printf 'public struct UnionBase {}\n' > Sources/CaffCore/Union.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'UnionStagedOnly'
+          git reset HEAD -- Sources/CaffCore/Union.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 4) Portable membership still sees staged-only index blobs.
+          mkdir -p Sources/CaffCore
+          printf 'public struct MembershipProbe {}\n' > Sources/CaffCore/MembershipProbe.swift
+          git add Sources/CaffCore/MembershipProbe.swift
+          rm Sources/CaffCore/MembershipProbe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'MembershipProbe'
+          git reset HEAD -- Sources/CaffCore/MembershipProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

@@ -21,7 +21,8 @@
 #     compatible.
 #   - Coarse regex per language (see LANGUAGE_PATTERNS below). L1 documents
 #     public API at the type level, so coarse is sufficient for drift.
-#   - --changed scans staged + unstaged + untracked sources (worktree view).
+#   - --changed scans staged + unstaged + untracked sources (unioning both
+#     snapshots when a path differs in the index and the worktree).
 #   - --staged scans only the index (for pre-commit's staged-only contract).
 
 set -e
@@ -150,7 +151,14 @@ repo_rel_or_die() {
 
 # Reject relative/absolute source globs that escape the repository before any
 # git pathspec work (including cases where the outside directory exists).
+# Slashless file globs such as '*.py' mean the repository root (same as
+# '$REPO_ROOT/*.py'); the trailing-suffix strip only matches slash-prefixed
+# patterns and would otherwise leave '*.py' as a bogus directory name.
 SRC_DIR_INPUT="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
+case "$SRC_DIR_INPUT" in
+    */*) ;;
+    *[\*\?]*) SRC_DIR_INPUT="." ;;
+esac
 SRC_DIR_REPO_REL="$(repo_rel_or_die "$SRC_DIR_INPUT")"
 
 # Pick the source directory for filesystem checks / full-mode find.
@@ -189,6 +197,18 @@ filter_paths_z() {
             *."$ext") printf '%s\0' "$path" ;;
         esac
     done
+}
+
+# Membership test for NUL-delimited path lists. Avoid GNU-only `grep -z`
+# (macOS / BSD grep historically lack lowercase -z; failed checks would
+# silently treat every staged path as absent from the list).
+path_in_z_list() {
+    local needle="$1" file="$2" path
+    [[ -s "$file" ]] || return 1
+    while IFS= read -r -d '' path; do
+        [[ "$path" == "$needle" ]] && return 0
+    done < "$file"
+    return 1
 }
 
 # Decide which files to scan, in --changed/--staged mode or full mode.
@@ -263,6 +283,11 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
             L1_SOURCE="$WORK/l1_blob.md"
         elif git -C "$REPO_ROOT" cat-file -e "HEAD:$L1_REL" 2>/dev/null; then
             # Tracked in HEAD but removed from the index (e.g. git rm --cached).
+            : > "$WORK/l1_blob.md"
+            L1_SOURCE="$WORK/l1_blob.md"
+        elif [[ $STAGED_ONLY -eq 1 ]]; then
+            # Index-only scan: never fall back to a worktree-only KB (e.g.
+            # initial commit staging sources but not the knowledge base).
             : > "$WORK/l1_blob.md"
             L1_SOURCE="$WORK/l1_blob.md"
         elif [[ ! -f "$L1_FILE" ]]; then
@@ -362,21 +387,35 @@ append_extracted() {
 
 scan_one() {
     local rel="$1"
+    local in_staged=0 in_worktree=0
     [[ -z "$rel" ]] && return 0
-    # --staged always reads the index blob. Under --changed, prefer the
-    # worktree when the same path also has unstaged edits so an API added
-    # only after staging is not missed; otherwise use the index blob so a
-    # staged-only path still matches commit contents when the worktree diverges.
-    # A staged path deleted only in the worktree (AD) still appears in both
-    # lists — fall back to the index blob so symbols are not dropped.
-    if [[ $CHANGED_ONLY -eq 1 ]] && grep -F -z -x -q -- "$rel" "$STAGED_FILES" 2>/dev/null; then
-        if [[ $STAGED_ONLY -eq 1 ]] \
-            || ! grep -F -z -x -q -- "$rel" "$WORKTREE_FILES" 2>/dev/null \
-            || [[ ! -f "$REPO_ROOT/$rel" ]]; then
-            git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-                | append_extracted "$rel" 2>/dev/null || true
-            return 0
+    # --staged always reads the index blob. Under --changed, a path present
+    # in both staged and worktree lists must union symbols from both snapshots:
+    # preferring only the worktree misses APIs that exist solely in the index
+    # (e.g. staged new definition + worktree restored to HEAD), while preferring
+    # only the index misses post-stage worktree additions. A staged path deleted
+    # only in the worktree (AD) still contributes the index blob.
+    if [[ $CHANGED_ONLY -eq 1 ]]; then
+        path_in_z_list "$rel" "$STAGED_FILES" && in_staged=1
+        path_in_z_list "$rel" "$WORKTREE_FILES" && in_worktree=1
+    fi
+    if [[ $STAGED_ONLY -eq 1 ]]; then
+        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+            | append_extracted "$rel" 2>/dev/null || true
+        return 0
+    fi
+    if [[ $CHANGED_ONLY -eq 1 && $in_staged -eq 1 && $in_worktree -eq 1 ]]; then
+        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+            | append_extracted "$rel" 2>/dev/null || true
+        if [[ -f "$REPO_ROOT/$rel" ]]; then
+            append_extracted "$rel" < "$REPO_ROOT/$rel" 2>/dev/null || true
         fi
+        return 0
+    fi
+    if [[ $CHANGED_ONLY -eq 1 && $in_staged -eq 1 ]]; then
+        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+            | append_extracted "$rel" 2>/dev/null || true
+        return 0
     fi
     f="$REPO_ROOT/$rel"
     [[ -f "$f" ]] || return 0

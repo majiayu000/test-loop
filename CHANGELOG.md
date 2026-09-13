@@ -24,12 +24,17 @@
   knowledge base when scanning unstaged sources, treats an index-deleted
   knowledge base as empty instead of falling back to the worktree, and rejects
   relative `--source-glob` values that escape the repository via `..`.
-- `--changed` prefers the worktree when a path has both staged and unstaged
-  edits (so post-stage API additions are not missed), but falls back to the
-  index blob when the worktree copy is gone (staged+deleted / AD) so symbols
-  are not dropped; extracted records use NUL-delimited path/symbol pairs so
-  newline-bearing pathnames cannot invent phantom missing symbols; `--staged`
-  no longer requires the source directory to exist in the worktree.
+- `--changed` unions index and worktree symbols when a path has both staged and
+  unstaged edits (so neither post-stage worktree APIs nor staged-only APIs are
+  missed), and falls back to the index blob when the worktree copy is gone
+  (staged+deleted / AD); extracted records use NUL-delimited path/symbol pairs
+  so newline-bearing pathnames cannot invent phantom missing symbols;
+  `--staged` no longer requires the source directory to exist in the worktree.
+- Staged path membership uses a portable bash NUL-list probe instead of
+  GNU-only `grep -z`; `--staged` treats a worktree-only knowledge base as empty
+  rather than falling back to the uncommitted file; slashless
+  `--source-glob '*.ext'` is normalized to the repository root like
+  `$REPO_ROOT/*.ext`.
 
 ## v0.1.0 - 2026-06-23
 
