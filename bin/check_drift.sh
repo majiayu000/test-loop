@@ -133,6 +133,8 @@ normalize_listed_paths() {
 # Drop paths with hidden components that an implicit wildcard would skip,
 # matching full-mode Python glob / find semantics. Literal directories and
 # explicitly named leading-dot segments (e.g. src/.generated/*.py) are kept.
+# Allowance is positional: src/.gen/**/*.py keeps src/.gen/x.py but not
+# src/.gen/sub/.gen/x.py (the nested .gen is only matched by **).
 filter_visible_paths() {
     local infile="$1"
     local outfile="$2"
@@ -154,92 +156,58 @@ filter_visible_paths() {
             ;;
     esac
 
-    # Explicitly named leading-dot path segments in the caller glob.
-    # Exact segments (src/.generated/*.py) and dot-leading wildcards
-    # (src/.*/h.py) both keep matching hidden path components.
-    local explicit_hidden=""
-    local explicit_hidden_globs=""
-    local seg
-    local _saved_ifs="$IFS"
-    set -f
-    IFS='/'
-    # shellcheck disable=SC2086
-    set -- $rel_pat
-    IFS="$_saved_ifs"
-    set +f
-    for seg in "$@"; do
-        case "$seg" in
-            .|..|'') continue ;;
-            .*)
-                case "$seg" in
-                    *'*'*|*'?'*|*'['*)
-                        explicit_hidden_globs="$explicit_hidden_globs|$seg"
-                        ;;
-                    *)
-                        explicit_hidden="$explicit_hidden/$seg/"
-                        ;;
-                esac
-                ;;
-        esac
-    done
+    python3 - "$infile" "$outfile" "$rel_pat" <<'PY'
+import fnmatch
+import sys
 
-    while IFS= read -r rel; do
-        [[ -z "$rel" ]] && continue
-        local keep=1
-        local path_segs="$rel"
-        while [ -n "$path_segs" ]; do
-            case "$path_segs" in
-                */*)
-                    seg="${path_segs%%/*}"
-                    path_segs="${path_segs#*/}"
-                    ;;
-                *)
-                    seg="$path_segs"
-                    path_segs=""
-                    ;;
-            esac
-            case "$seg" in
-                .|..|'') continue ;;
-                .*)
-                    local allow_hidden=0
-                    case "$explicit_hidden" in
-                        */"$seg"/*) allow_hidden=1 ;;
-                    esac
-                    if [ "$allow_hidden" -eq 0 ] && [ -n "$explicit_hidden_globs" ]; then
-                        local g
-                        local glob_rest="$explicit_hidden_globs"
-                        while [ -n "$glob_rest" ]; do
-                            case "$glob_rest" in
-                                \|*) glob_rest="${glob_rest#|}" ;;
-                            esac
-                            [ -z "$glob_rest" ] && break
-                            case "$glob_rest" in
-                                *\|*)
-                                    g="${glob_rest%%|*}"
-                                    glob_rest="${glob_rest#*|}"
-                                    ;;
-                                *)
-                                    g="$glob_rest"
-                                    glob_rest=""
-                                    ;;
-                            esac
-                            [[ -z "$g" ]] && continue
-                            case "$seg" in
-                                $g) allow_hidden=1; break ;;
-                            esac
-                        done
-                    fi
-                    if [ "$allow_hidden" -eq 0 ]; then
-                        keep=0
-                        break
-                    fi
-                    ;;
-            esac
-        done
-        if [ "$keep" -eq 1 ]; then
-            printf '%s\n' "$rel" >> "$outfile"
-        fi
-    done < "$infile"
+infile, outfile, pattern = sys.argv[1], sys.argv[2], sys.argv[3]
+pat_parts = [p for p in pattern.split("/") if p and p not in (".",)]
+
+
+def seg_matches(pat, name):
+    if any(c in pat for c in "*?["):
+        # Python glob: * / ? / [] do not match a leading-dot name unless the
+        # pattern segment itself begins with '.'.
+        if not pat.startswith(".") and name.startswith("."):
+            return False
+        return fnmatch.fnmatch(name, pat)
+    return pat == name
+
+
+def path_matches(path_parts, pat_parts):
+    if not pat_parts:
+        return not path_parts
+    if pat_parts[0] == "**":
+        # Empty ** match.
+        if path_matches(path_parts, pat_parts[1:]):
+            return True
+        if not path_parts:
+            return False
+        # ** never consumes a leading-dot component.
+        if path_parts[0].startswith("."):
+            return False
+        return path_matches(path_parts[1:], pat_parts)
+    if not path_parts:
+        return False
+    if not seg_matches(pat_parts[0], path_parts[0]):
+        return False
+    return path_matches(path_parts[1:], pat_parts[1:])
+
+
+kept = []
+with open(infile, encoding="utf-8") as fh:
+    for line in fh:
+        rel = line.rstrip("\n")
+        if not rel:
+            continue
+        parts = [p for p in rel.split("/") if p and p not in (".",)]
+        if path_matches(parts, pat_parts):
+            kept.append(rel)
+
+with open(outfile, "w", encoding="utf-8") as fh:
+    for rel in kept:
+        fh.write(rel + "\n")
+PY
 }
 
 # --knowledge-base may be a Markdown file or a directory of *.md files.
@@ -260,7 +228,12 @@ if [ -d "$KNOWLEDGE_BASE" ]; then
     > "$L1_FILE"
     while IFS= read -r kb; do
         [[ -z "$kb" ]] && continue
-        cat "$kb" >> "$L1_FILE"
+        # Unreadable KB files are an input/permissions error (exit 2), not
+        # documentation drift (exit 1). Guard cat under set -e accordingly.
+        if ! cat "$kb" >> "$L1_FILE"; then
+            echo "error: failed to read knowledge file $kb" >&2
+            exit 2
+        fi
         printf '\n' >> "$L1_FILE"
     done < "$KB_LIST"
 elif [ -f "$KNOWLEDGE_BASE" ]; then
@@ -388,6 +361,30 @@ def probe_reachable(base, dir_parts):
         return
     part, rest = dir_parts[0], dir_parts[1:]
     if part == "**":
+        # When ** is followed by more segments (e.g. **/.generated/**), keep
+        # probing `rest` at this level and below. A bare trailing ** only
+        # needs a recursive walk that prunes implicit leading-dot dirs.
+        if rest:
+            # Empty ** match: continue with the remaining pattern here.
+            probe_reachable(base, rest)
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=True)
+                except OSError as err:
+                    on_walk_error(err)
+                    continue
+                if not is_dir:
+                    continue
+                name = entry.name
+                if name.startswith("."):
+                    # ** itself does not enter hidden dirs; an explicit
+                    # following segment (e.g. .generated) still may.
+                    if name_matches(rest[0], name):
+                        probe_reachable(entry.path, rest[1:])
+                    continue
+                # Consume one non-hidden component and keep ** active.
+                probe_reachable(entry.path, dir_parts)
+            return
         # glob.glob recursive listing skips leading-dot names unless a later
         # segment names them explicitly; prune the same way so unreadable
         # implicit-hidden trees do not false-fail the probe.
@@ -460,23 +457,48 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     # names without a leading './' or redundant '/./' components.
     GLOB_FOR_GIT="$(printf '%s' "$GLOB_FOR_GIT" | sed -E 's|^\./||;s|/\./|/|g')"
     PATHSPEC=":(glob)$GLOB_FOR_GIT"
-    {
-        git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC" 2>/dev/null || true
-        git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC" 2>/dev/null || true
-        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC" 2>/dev/null || true
-    } | sort -u > "$WORK/changed_raw.txt"
-    # Track staged vs unstaged/untracked so symbol extraction can read the
-    # index blob for cached paths (pre-commit) instead of only the worktree.
-    git -C "$REPO_ROOT" diff --cached --name-only -- "$PATHSPEC" 2>/dev/null \
-        | sort -u > "$WORK/changed_cached.txt" || true
-    {
-        git -C "$REPO_ROOT" diff --name-only -- "$PATHSPEC" 2>/dev/null || true
-        git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$PATHSPEC" 2>/dev/null || true
-    } | sort -u > "$WORK/changed_worktree.txt" || true
+    # Collect changed paths as NUL-delimited names so non-ASCII / special
+    # characters are not C-quoted (e.g. "caf\303\251.py") and lost by the
+    # extension filter. Fail closed if Git cannot enumerate changes.
+    git_changed_names() {
+        local out="$1"
+        shift
+        local err="$WORK/git_names_err.txt"
+        local raw="$WORK/git_names_raw.bin"
+        local rc
+        set +e
+        git -C "$REPO_ROOT" -c core.quotepath=false "$@" > "$raw" 2>"$err"
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+            cat "$err" >&2
+            echo "error: git failed while listing changed files" >&2
+            return "$rc"
+        fi
+        # Translate NUL-delimited records to newline-separated paths.
+        python3 - "$raw" "$out" <<'PY'
+import sys
+raw, out = sys.argv[1], sys.argv[2]
+data = open(raw, "rb").read()
+paths = [p.decode("utf-8", "surrogateescape") for p in data.split(b"\0") if p]
+with open(out, "w", encoding="utf-8") as fh:
+    for p in paths:
+        fh.write(p + "\n")
+PY
+    }
+
+    git_changed_names "$WORK/changed_unstaged.txt" diff -z --name-only -- "$PATHSPEC" || exit 2
+    git_changed_names "$WORK/changed_cached.txt" diff -z --cached --name-only -- "$PATHSPEC" || exit 2
+    git_changed_names "$WORK/changed_untracked.txt" ls-files -z --others --exclude-standard -- "$PATHSPEC" || exit 2
+    sort -u "$WORK/changed_unstaged.txt" "$WORK/changed_cached.txt" "$WORK/changed_untracked.txt" \
+        > "$WORK/changed_raw.txt"
+    sort -u "$WORK/changed_unstaged.txt" "$WORK/changed_untracked.txt" \
+        > "$WORK/changed_worktree.txt"
     # grep exits 1 on no matches; with set -e that must not abort before
     # the empty-list success path below. Then drop hidden-component paths so
     # :(glob) matches full-mode glob (which skips leading-dot names), while
-    # preserving paths whose leading-dot segments were named explicitly.
+    # preserving paths whose leading-dot segments were named explicitly
+    # (positionally — nested dots matched only by ** are still dropped).
     grep -E "\.${LANG_EXT}$" "$WORK/changed_raw.txt" > "$WORK/changed_ext.txt" || true
     filter_visible_paths "$WORK/changed_ext.txt" "$LIST_OF_FILES" "$SOURCE_GLOB"
     if [[ ! -s "$LIST_OF_FILES" ]]; then
