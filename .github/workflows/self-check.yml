@@ -531,6 +531,58 @@ jobs:
           git checkout -- "$kb"
           git reset HEAD -- "$kb" 2>/dev/null || true
           rm -rf Sources/CaffCore
+
+          # 6) Filename-specific --source-glob must not become dir/*.ext.
+          mkdir -p src
+          printf 'def FileGlobProbe():\n    pass\n' > src/api.py
+          git add src/api.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src/api.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'FileGlobProbe'
+          printf 'def FileGlobStarProbe():\n    pass\n' > src/test_x.py
+          git add src/test_x.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src/test_*.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'FileGlobStarProbe'
+          git reset HEAD -- src/api.py src/test_x.py 2>/dev/null || true
+          rm -rf src
+
+          # 7) --changed --language auto must consult index-only manifests.
+          mkdir -p src
+          printf 'def ChangedAutoProbe():\n    pass\n' > src/a.py
+          printf '[project]\nname = "probe"\n' > pyproject.toml
+          git add src/a.py pyproject.toml
+          rm -f pyproject.toml
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'ChangedAutoProbe'
+          git reset HEAD -- src/a.py pyproject.toml 2>/dev/null || true
+          rm -rf src
+          rm -f pyproject.toml
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

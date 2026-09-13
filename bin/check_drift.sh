@@ -72,6 +72,8 @@ L1_FILE="$KNOWLEDGE_BASE"
 # Auto-detect language from a project manifest. In --staged mode, resolve
 # exclusively from the index so a worktree-only higher-priority manifest
 # (e.g. unstaged Package.swift) cannot override staged pyproject.toml.
+# In --changed mode, prefer the worktree but fall back to the index so a
+# staged-then-deleted manifest still drives auto-detection for staged sources.
 manifest_present() {
     local name="$1"
     if [[ $STAGED_ONLY -eq 1 ]]; then
@@ -79,7 +81,15 @@ manifest_present() {
             && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
         return $?
     fi
-    [ -f "$REPO_ROOT/$name" ]
+    if [ -f "$REPO_ROOT/$name" ]; then
+        return 0
+    fi
+    if [[ $CHANGED_ONLY -eq 1 ]]; then
+        git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+            && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
+        return $?
+    fi
+    return 1
 }
 if [ "$LANGUAGE" = "auto" ]; then
     if manifest_present "Package.swift"; then LANGUAGE="swift"
@@ -173,11 +183,40 @@ esac
 # Slashless file globs such as '*.py' mean the repository root (same as
 # '$REPO_ROOT/*.py'); the trailing-suffix strip only matches slash-prefixed
 # patterns and would otherwise leave '*.py' as a bogus directory name.
-SRC_DIR_INPUT="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
-case "$SRC_DIR_INPUT" in
-    */*) ;;
-    *[\*\?]*) SRC_DIR_INPUT="." ;;
+#
+# Filename-specific patterns (src/api.py, src/test_*.py, src/**/api.py) must
+# keep the caller's file pattern: after peeling trailing /*.ext directory
+# globs, a remaining basename that still contains '.' is a file pathspec, not
+# a directory to rewrite as dir/*.ext.
+SRC_STRIPPED="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
+FILE_PATHSPEC_REPO_REL=""
+case "$SOURCE_GLOB_INPUT" in
+    */*)
+        _base="${SRC_STRIPPED##*/}"
+        case "$_base" in
+            *.*)
+                FILE_PATHSPEC_REPO_REL="$(repo_rel_or_die "$SOURCE_GLOB_INPUT")"
+                SRC_DIR_INPUT="${SRC_STRIPPED%/*}"
+                [[ -z "$SRC_DIR_INPUT" ]] && SRC_DIR_INPUT="."
+                ;;
+            *)
+                SRC_DIR_INPUT="$SRC_STRIPPED"
+                ;;
+        esac
+        ;;
+    *[\*\?]*)
+        SRC_DIR_INPUT="."
+        ;;
+    *.*)
+        # Slashless filename such as 'api.py' at the repository root.
+        FILE_PATHSPEC_REPO_REL="$(repo_rel_or_die "$SOURCE_GLOB_INPUT")"
+        SRC_DIR_INPUT="."
+        ;;
+    *)
+        SRC_DIR_INPUT="$SRC_STRIPPED"
+        ;;
 esac
+unset _base
 SRC_DIR_REPO_REL="$(repo_rel_or_die "$SRC_DIR_INPUT")"
 
 # Pick the source directory for filesystem checks / full-mode find.
@@ -259,9 +298,14 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     fi
     # SOURCE_GLOB may be a path or a path/**/*.ext pattern. Build repo-relative
     # git pathspecs: absolute pathspecs do not match, and ** alone omits files
-    # directly under the source directory.
+    # directly under the source directory. Filename-specific globs keep the
+    # caller's pattern (src/api.py) instead of becoming dir/*.ext.
     SRC_DIR_FOR_GIT="$SRC_DIR_REPO_REL"
-    if [[ -z "$SRC_DIR_FOR_GIT" || "$SRC_DIR_FOR_GIT" == "." ]]; then
+    if [[ -n "$FILE_PATHSPEC_REPO_REL" ]]; then
+        PATHSPEC_DIRECT="$FILE_PATHSPEC_REPO_REL"
+        PATHSPEC_NESTED="$FILE_PATHSPEC_REPO_REL"
+        SRC_DIR_FOR_GIT="$FILE_PATHSPEC_REPO_REL"
+    elif [[ -z "$SRC_DIR_FOR_GIT" || "$SRC_DIR_FOR_GIT" == "." ]]; then
         PATHSPEC_DIRECT="*.${LANG_EXT}"
         PATHSPEC_NESTED="**/*.${LANG_EXT}"
         SRC_DIR_FOR_GIT="."

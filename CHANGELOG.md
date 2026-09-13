@@ -46,6 +46,11 @@
   before index lookup; intermediate wildcard glob components are preserved
   (noglob split); a missing worktree knowledge base is treated as deleted/empty
   instead of falling back to the index blob.
+- Filename-specific `--source-glob` values (`src/api.py`, `src/test_*.py`,
+  `src/**/api.py`) are kept as git pathspecs instead of being rewritten to
+  `dir/*.ext` (which silently skipped matching files). `--changed --language
+  auto` falls back to index manifests when the worktree copy is missing, matching
+  how `--changed` already includes staged sources.
 
 ## v0.1.0 - 2026-06-23
 
