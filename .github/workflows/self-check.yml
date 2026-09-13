@@ -421,10 +421,10 @@ jobs:
           rm -f pyproject.toml
           rm -rf src
       - name: check_drift portable sort, staged auto, KB norm, globs, deleted KB
-        # Codex review follow-ups on 3a9e67d: portable NUL uniqueness (no
-        # sort -z || true), --staged --language auto from index only,
-        # normalize KB .. segments, preserve wildcard path components, and
-        # treat a missing worktree KB as deleted (empty).
+        # Codex review follow-ups: portable NUL uniqueness, dual-snapshot
+        # --changed --language auto, normalize KB .. segments, preserve
+        # wildcard path components (including dotless filename globs), treat a
+        # missing worktree KB as deleted, and dereference staged KB symlinks.
         run: |
           set -euo pipefail
           kb=templates/knowledge/L1_modules.md
@@ -583,6 +583,72 @@ jobs:
           git reset HEAD -- src/a.py pyproject.toml 2>/dev/null || true
           rm -rf src
           rm -f pyproject.toml
+
+          # 8) --changed --language auto must not let a worktree-only higher
+          #    priority manifest (Package.swift) mask staged Python sources.
+          mkdir -p src
+          printf '[project]\nname = "probe"\n' > pyproject.toml
+          printf 'def ChangedAutoDualProbe():\n    pass\n' > src/a.py
+          git add pyproject.toml src/a.py
+          printf '// swift package\n' > Package.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'ChangedAutoDualProbe'
+          git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
+          rm -f pyproject.toml Package.swift
+          rm -rf src
+
+          # 9) Dotless filename wildcards (src/**/test_*) must stay file
+          #    pathspecs, not become dir/*.ext.
+          mkdir -p src/unit
+          printf 'def DotlessGlobProbe():\n    pass\n' > src/unit/test_api.py
+          git add src/unit/test_api.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src/**/test_*' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DotlessGlobProbe'
+          git reset HEAD -- src/unit/test_api.py 2>/dev/null || true
+          rm -rf src
+
+          # 10) Staged knowledge-base symlink must be dereferenced to the
+          #     target Markdown blob (not the symlink pathname).
+          mkdir -p Sources/CaffCore docs/knowledge
+          printf 'public struct SymlinkKbProbe {}\n' > Sources/CaffCore/SymlinkKbProbe.swift
+          printf 'SymlinkKbProbe\n' > docs/knowledge/L1_symlink_target.md
+          ln -sf L1_symlink_target.md docs/knowledge/L1_symlink.md
+          git add Sources/CaffCore/SymlinkKbProbe.swift \
+            docs/knowledge/L1_symlink_target.md docs/knowledge/L1_symlink.md
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base 'docs/knowledge/L1_symlink.md' \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- Sources/CaffCore/SymlinkKbProbe.swift \
+            docs/knowledge/L1_symlink_target.md docs/knowledge/L1_symlink.md \
+            2>/dev/null || true
+          rm -rf Sources/CaffCore docs/knowledge/L1_symlink_target.md \
+            docs/knowledge/L1_symlink.md
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

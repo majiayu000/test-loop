@@ -69,50 +69,113 @@ case "$KNOWLEDGE_BASE" in
 esac
 L1_FILE="$KNOWLEDGE_BASE"
 
-# Auto-detect language from a project manifest. In --staged mode, resolve
-# exclusively from the index so a worktree-only higher-priority manifest
-# (e.g. unstaged Package.swift) cannot override staged pyproject.toml.
-# In --changed mode, prefer the worktree but fall back to the index so a
-# staged-then-deleted manifest still drives auto-detection for staged sources.
-manifest_present() {
-    local name="$1"
-    if [[ $STAGED_ONLY -eq 1 ]]; then
-        git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
-            && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
-        return $?
-    fi
-    if [ -f "$REPO_ROOT/$name" ]; then
-        return 0
-    fi
-    if [[ $CHANGED_ONLY -eq 1 ]]; then
-        git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
-            && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
-        return $?
-    fi
-    return 1
+# Auto-detect language from a project manifest snapshot.
+# snapshot=index  -> index blobs only (--staged, and the staged side of --changed)
+# snapshot=worktree -> worktree files only
+# snapshot=either -> worktree first, then index (full-mode / single-language fallback)
+manifest_present_in() {
+    local snapshot="$1" name="$2"
+    case "$snapshot" in
+        index)
+            git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+                && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
+            return $?
+            ;;
+        worktree)
+            [ -f "$REPO_ROOT/$name" ]
+            return $?
+            ;;
+        either)
+            if [ -f "$REPO_ROOT/$name" ]; then
+                return 0
+            fi
+            git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+                && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
+            return $?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
-if [ "$LANGUAGE" = "auto" ]; then
-    if manifest_present "Package.swift"; then LANGUAGE="swift"
-    elif manifest_present "pyproject.toml"; then LANGUAGE="python"
-    elif manifest_present "go.mod"; then LANGUAGE="go"
-    elif manifest_present "Cargo.toml"; then LANGUAGE="rust"
+
+detect_language_in() {
+    local snapshot="$1"
+    if manifest_present_in "$snapshot" "Package.swift"; then
+        printf '%s\n' "swift"
+    elif manifest_present_in "$snapshot" "pyproject.toml"; then
+        printf '%s\n' "python"
+    elif manifest_present_in "$snapshot" "go.mod"; then
+        printf '%s\n' "go"
+    elif manifest_present_in "$snapshot" "Cargo.toml"; then
+        printf '%s\n' "rust"
     else
-        echo "error: --language auto could not find Package.swift / pyproject.toml / go.mod / Cargo.toml" >&2
-        exit 2
+        return 1
     fi
+}
+
+lang_ext_for() {
+    case "$1" in
+        swift)  printf '%s\n' "swift" ;;
+        python) printf '%s\n' "py" ;;
+        go)     printf '%s\n' "go" ;;
+        rust)   printf '%s\n' "rs" ;;
+        *)      return 1 ;;
+    esac
+}
+
+INDEX_LANGUAGE=""
+WORKTREE_LANGUAGE=""
+if [ "$LANGUAGE" = "auto" ]; then
+    if [[ $STAGED_ONLY -eq 1 ]]; then
+        # --staged: index-only so a worktree-only higher-priority manifest
+        # (e.g. unstaged Package.swift) cannot override staged pyproject.toml.
+        if ! LANGUAGE="$(detect_language_in index)"; then
+            echo "error: --language auto could not find Package.swift / pyproject.toml / go.mod / Cargo.toml" >&2
+            exit 2
+        fi
+        INDEX_LANGUAGE="$LANGUAGE"
+        WORKTREE_LANGUAGE="$LANGUAGE"
+    elif [[ $CHANGED_ONLY -eq 1 ]]; then
+        # --changed: resolve index and worktree languages independently so a
+        # worktree-only higher-priority manifest cannot mask staged sources.
+        INDEX_LANGUAGE="$(detect_language_in index || true)"
+        WORKTREE_LANGUAGE="$(detect_language_in worktree || true)"
+        if [[ -z "$INDEX_LANGUAGE" && -z "$WORKTREE_LANGUAGE" ]]; then
+            echo "error: --language auto could not find Package.swift / pyproject.toml / go.mod / Cargo.toml" >&2
+            exit 2
+        fi
+        [[ -z "$INDEX_LANGUAGE" ]] && INDEX_LANGUAGE="$WORKTREE_LANGUAGE"
+        [[ -z "$WORKTREE_LANGUAGE" ]] && WORKTREE_LANGUAGE="$INDEX_LANGUAGE"
+        LANGUAGE="$WORKTREE_LANGUAGE"
+    else
+        if ! LANGUAGE="$(detect_language_in either)"; then
+            echo "error: --language auto could not find Package.swift / pyproject.toml / go.mod / Cargo.toml" >&2
+            exit 2
+        fi
+        INDEX_LANGUAGE="$LANGUAGE"
+        WORKTREE_LANGUAGE="$LANGUAGE"
+    fi
+else
+    case "$LANGUAGE" in
+        swift|python|go|rust) ;;
+        *)
+            echo "error: unsupported --language: $LANGUAGE (swift|python|go|rust|auto)" >&2
+            exit 2
+            ;;
+    esac
+    INDEX_LANGUAGE="$LANGUAGE"
+    WORKTREE_LANGUAGE="$LANGUAGE"
 fi
 
 # Language -> file extension used for filtering and the awk symbol rules.
-case "$LANGUAGE" in
-    swift)  LANG_EXT="swift" ;;
-    python) LANG_EXT="py" ;;
-    go)     LANG_EXT="go" ;;
-    rust)   LANG_EXT="rs" ;;
-    *)
-        echo "error: unsupported --language: $LANGUAGE (swift|python|go|rust|auto)" >&2
-        exit 2
-        ;;
-esac
+# Changed+auto may use distinct staged vs worktree extensions.
+if ! LANG_EXT="$(lang_ext_for "$LANGUAGE")"; then
+    echo "error: unsupported --language: $LANGUAGE (swift|python|go|rust|auto)" >&2
+    exit 2
+fi
+INDEX_LANG_EXT="$(lang_ext_for "$INDEX_LANGUAGE")"
+WORKTREE_LANG_EXT="$(lang_ext_for "$WORKTREE_LANGUAGE")"
 
 # Lexically normalize a path (absolute or repo-relative) and ensure it stays
 # inside REPO_ROOT. Prints a repo-relative path (or ".") on success.
@@ -184,17 +247,18 @@ esac
 # '$REPO_ROOT/*.py'); the trailing-suffix strip only matches slash-prefixed
 # patterns and would otherwise leave '*.py' as a bogus directory name.
 #
-# Filename-specific patterns (src/api.py, src/test_*.py, src/**/api.py) must
-# keep the caller's file pattern: after peeling trailing /*.ext directory
-# globs, a remaining basename that still contains '.' is a file pathspec, not
-# a directory to rewrite as dir/*.ext.
+# Filename-specific patterns (src/api.py, src/test_*.py, src/**/api.py,
+# src/**/test_*) must keep the caller's file pattern: after peeling trailing
+# /*.ext directory globs, a remaining basename that still looks like a file
+# pathspec (contains '.' or a wildcard metacharacter) must not be rewritten as
+# dir/*.ext. Dotless wildcards such as test_* are valid Git pathspecs.
 SRC_STRIPPED="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*$||')"
 FILE_PATHSPEC_REPO_REL=""
 case "$SOURCE_GLOB_INPUT" in
     */*)
         _base="${SRC_STRIPPED##*/}"
         case "$_base" in
-            *.*)
+            *.*|*[\*\?]*|*\[*)
                 FILE_PATHSPEC_REPO_REL="$(repo_rel_or_die "$SOURCE_GLOB_INPUT")"
                 SRC_DIR_INPUT="${SRC_STRIPPED%/*}"
                 [[ -z "$SRC_DIR_INPUT" ]] && SRC_DIR_INPUT="."
@@ -204,7 +268,9 @@ case "$SOURCE_GLOB_INPUT" in
                 ;;
         esac
         ;;
-    *[\*\?]*)
+    *[\*\?]*|*\[*)
+        # Slashless wildcards such as '*.py' mean the repository root (same as
+        # '$REPO_ROOT/*.py'); keep directory-root pathspec expansion.
         SRC_DIR_INPUT="."
         ;;
     *.*)
@@ -275,18 +341,30 @@ path_in_z_list() {
 }
 
 # Unique NUL-delimited paths without `sort -z` (absent or unreliable on some
-# BSD/macOS sort builds). Failed GNU-only sort piped through `|| true` would
-# leave an empty list and silently skip every staged API.
+# BSD/macOS sort builds). Use an O(n) hash-set directory instead of scanning
+# the accumulated list for every path (quadratic membership hung pre-commit
+# on ~2k staged files).
 unique_paths_z() {
-    local out="$1" path
-    local tmp
+    local out="$1" path key setdir tmp
+    setdir="$(mktemp -d "$WORK/unique_set.XXXXXX")"
     tmp="$(mktemp "$WORK/unique_paths.XXXXXX")"
     : > "$tmp"
     while IFS= read -r -d '' path; do
         [[ -z "$path" ]] && continue
-        path_in_z_list "$path" "$tmp" && continue
+        key="$(printf '%s' "$path" | shasum -a 256 2>/dev/null | awk '{print $1}')"
+        if [[ -z "$key" ]]; then
+            # Extremely defensive fallback if shasum is unavailable.
+            path_in_z_list "$path" "$tmp" && continue
+            printf '%s\0' "$path" >> "$tmp"
+            continue
+        fi
+        if [[ -e "$setdir/$key" ]]; then
+            continue
+        fi
+        : > "$setdir/$key"
         printf '%s\0' "$path" >> "$tmp"
     done
+    rm -rf "$setdir"
     mv "$tmp" "$out"
 }
 
@@ -300,35 +378,48 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     # git pathspecs: absolute pathspecs do not match, and ** alone omits files
     # directly under the source directory. Filename-specific globs keep the
     # caller's pattern (src/api.py) instead of becoming dir/*.ext.
-    SRC_DIR_FOR_GIT="$SRC_DIR_REPO_REL"
-    if [[ -n "$FILE_PATHSPEC_REPO_REL" ]]; then
-        PATHSPEC_DIRECT="$FILE_PATHSPEC_REPO_REL"
-        PATHSPEC_NESTED="$FILE_PATHSPEC_REPO_REL"
-        SRC_DIR_FOR_GIT="$FILE_PATHSPEC_REPO_REL"
-    elif [[ -z "$SRC_DIR_FOR_GIT" || "$SRC_DIR_FOR_GIT" == "." ]]; then
-        PATHSPEC_DIRECT="*.${LANG_EXT}"
-        PATHSPEC_NESTED="**/*.${LANG_EXT}"
-        SRC_DIR_FOR_GIT="."
-    else
-        PATHSPEC_DIRECT="${SRC_DIR_FOR_GIT}/*.${LANG_EXT}"
-        PATHSPEC_NESTED="${SRC_DIR_FOR_GIT}/**/*.${LANG_EXT}"
-    fi
+    # Emit pathspecs for a language extension into PATHSPEC_DIRECT/NESTED and
+    # set SRC_DIR_FOR_GIT for messaging.
+    build_pathspecs_for_ext() {
+        local ext="$1"
+        SRC_DIR_FOR_GIT="$SRC_DIR_REPO_REL"
+        if [[ -n "$FILE_PATHSPEC_REPO_REL" ]]; then
+            PATHSPEC_DIRECT="$FILE_PATHSPEC_REPO_REL"
+            PATHSPEC_NESTED="$FILE_PATHSPEC_REPO_REL"
+            SRC_DIR_FOR_GIT="$FILE_PATHSPEC_REPO_REL"
+        elif [[ -z "$SRC_DIR_FOR_GIT" || "$SRC_DIR_FOR_GIT" == "." ]]; then
+            PATHSPEC_DIRECT="*.${ext}"
+            PATHSPEC_NESTED="**/*.${ext}"
+            SRC_DIR_FOR_GIT="."
+        else
+            PATHSPEC_DIRECT="${SRC_DIR_FOR_GIT}/*.${ext}"
+            PATHSPEC_NESTED="${SRC_DIR_FOR_GIT}/**/*.${ext}"
+        fi
+    }
+    build_pathspecs_for_ext "$INDEX_LANG_EXT"
     {
         git -C "$REPO_ROOT" diff --cached -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-    } | filter_paths_z "$LANG_EXT" | unique_paths_z "$STAGED_FILES"
+    } | filter_paths_z "$INDEX_LANG_EXT" | unique_paths_z "$STAGED_FILES"
     if [[ $STAGED_ONLY -eq 1 ]]; then
         cp "$STAGED_FILES" "$LIST_OF_FILES"
     else
+        build_pathspecs_for_ext "$WORKTREE_LANG_EXT"
         {
             git -C "$REPO_ROOT" diff -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
             git -C "$REPO_ROOT" ls-files -z --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-        } | filter_paths_z "$LANG_EXT" | unique_paths_z "$WORKTREE_FILES"
+        } | filter_paths_z "$WORKTREE_LANG_EXT" | unique_paths_z "$WORKTREE_FILES"
         {
             cat "$STAGED_FILES" "$WORKTREE_FILES"
         } | unique_paths_z "$LIST_OF_FILES"
+        # Prefer a stable messaging root; filename pathspecs win when set.
+        build_pathspecs_for_ext "$LANG_EXT"
     fi
     if [[ ! -s "$LIST_OF_FILES" ]]; then
-        echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
+        if [[ "$INDEX_LANGUAGE" != "$WORKTREE_LANGUAGE" ]]; then
+            echo "no changed $INDEX_LANGUAGE/$WORKTREE_LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
+        else
+            echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
+        fi
         exit 0
     fi
 else
@@ -359,9 +450,53 @@ fi
 INDEX_L1_SOURCE=""
 WORKTREE_L1_SOURCE=""
 
+# Read an index (or HEAD) blob, dereferencing in-repo symlink objects so a
+# tracked KB symlink yields the target Markdown content rather than the
+# symlink pathname stored in the blob.
+git_show_blob_deref() {
+    local rev_path="$1" dest="$2"
+    local mode="" target="" base_dir="" resolved=""
+    local spec_path="${rev_path#*:}"
+    local rev_prefix="${rev_path%%:*}"
+    if [[ "$rev_prefix" == ":" || "$rev_prefix" == "" ]]; then
+        mode="$(git -C "$REPO_ROOT" ls-files --stage -- "$spec_path" 2>/dev/null | awk '{print $1; exit}')"
+    else
+        mode="$(git -C "$REPO_ROOT" ls-tree "$rev_prefix" -- "$spec_path" 2>/dev/null | awk '{print $1; exit}')"
+    fi
+    if [[ "$mode" == "120000" ]]; then
+        target="$(git -C "$REPO_ROOT" show "$rev_path" 2>/dev/null || true)"
+        [[ -z "$target" ]] && return 1
+        case "$target" in
+            /*)
+                # Absolute symlink targets are not index paths; refuse.
+                return 1
+                ;;
+            *)
+                base_dir="$(dirname "$spec_path")"
+                if [[ "$base_dir" == "." ]]; then
+                    resolved="$target"
+                else
+                    resolved="$base_dir/$target"
+                fi
+                # Collapse . / .. without leaving the repo spelling git expects.
+                resolved="$(repo_rel_or_die "$REPO_ROOT/$resolved")"
+                if [[ "$rev_prefix" == ":" || "$rev_prefix" == "" ]]; then
+                    git -C "$REPO_ROOT" show ":$resolved" > "$dest" 2>/dev/null
+                else
+                    git -C "$REPO_ROOT" show "$rev_prefix:$resolved" > "$dest" 2>/dev/null
+                fi
+                return $?
+                ;;
+        esac
+    fi
+    git -C "$REPO_ROOT" show "$rev_path" > "$dest" 2>/dev/null
+}
+
 resolve_index_l1() {
     if git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
-        git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_index.md"
+        if ! git_show_blob_deref ":$L1_REL" "$WORK/l1_index.md"; then
+            : > "$WORK/l1_index.md"
+        fi
         INDEX_L1_SOURCE="$WORK/l1_index.md"
     elif git -C "$REPO_ROOT" cat-file -e "HEAD:$L1_REL" 2>/dev/null; then
         # Tracked in HEAD but removed from the index (e.g. git rm --cached).
@@ -389,7 +524,8 @@ resolve_worktree_l1() {
 # The caller pairs names with the source path via NUL-delimited EXTRACTED
 # records so pathnames with embedded newlines stay unambiguous.
 emit_awk() {
-    case "$LANGUAGE" in
+    local lang="${1:-$LANGUAGE}"
+    case "$lang" in
         swift)
             awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
@@ -455,59 +591,48 @@ emit_awk() {
 
 # Append path/symbol pairs from stdin source text into the given EXTRACTED file.
 append_extracted() {
-    local rel="$1" out="$2" name
-    emit_awk | while IFS= read -r name; do
+    local rel="$1" out="$2" lang="${3:-$LANGUAGE}" name
+    emit_awk "$lang" | while IFS= read -r name; do
         [[ -z "$name" ]] && continue
         printf '%s\0%s\0' "$rel" "$name" >> "$out"
     done
 }
 
-scan_one() {
+# Extract symbols for one path from the index and/or worktree without
+# membership probes. --staged never consults worktree lists; --changed
+# iterates each origin's path list independently so scan cost stays linear.
+extract_staged_path() {
     local rel="$1"
-    local in_staged=0 in_worktree=0
     [[ -z "$rel" ]] && return 0
-    # --staged always reads the index blob. Under --changed, a path present
-    # in both staged and worktree lists must union symbols from both snapshots:
-    # preferring only the worktree misses APIs that exist solely in the index
-    # (e.g. staged new definition + worktree restored to HEAD), while preferring
-    # only the index misses post-stage worktree additions. A staged path deleted
-    # only in the worktree (AD) still contributes the index blob. Origins are
-    # recorded separately so each set is checked against its matching KB.
-    if [[ $CHANGED_ONLY -eq 1 ]]; then
-        path_in_z_list "$rel" "$STAGED_FILES" && in_staged=1
-        path_in_z_list "$rel" "$WORKTREE_FILES" && in_worktree=1
-    fi
-    if [[ $STAGED_ONLY -eq 1 ]]; then
-        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | append_extracted "$rel" "$EXTRACTED_STAGED" 2>/dev/null || true
-        return 0
-    fi
-    if [[ $CHANGED_ONLY -eq 1 && $in_staged -eq 1 && $in_worktree -eq 1 ]]; then
-        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | append_extracted "$rel" "$EXTRACTED_STAGED" 2>/dev/null || true
-        if [[ -f "$REPO_ROOT/$rel" ]]; then
-            append_extracted "$rel" "$EXTRACTED_WORKTREE" < "$REPO_ROOT/$rel" 2>/dev/null || true
-        fi
-        return 0
-    fi
-    if [[ $CHANGED_ONLY -eq 1 && $in_staged -eq 1 ]]; then
-        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | append_extracted "$rel" "$EXTRACTED_STAGED" 2>/dev/null || true
-        return 0
-    fi
-    f="$REPO_ROOT/$rel"
-    [[ -f "$f" ]] || return 0
-    append_extracted "$rel" "$EXTRACTED_WORKTREE" < "$f" 2>/dev/null || true
+    git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+        | append_extracted "$rel" "$EXTRACTED_STAGED" "$INDEX_LANGUAGE" 2>/dev/null || true
 }
 
-if [[ $CHANGED_ONLY -eq 1 ]]; then
+extract_worktree_path() {
+    local rel="$1"
+    local f
+    [[ -z "$rel" ]] && return 0
+    f="$REPO_ROOT/$rel"
+    [[ -f "$f" ]] || return 0
+    append_extracted "$rel" "$EXTRACTED_WORKTREE" "$WORKTREE_LANGUAGE" < "$f" 2>/dev/null || true
+}
+
+if [[ $STAGED_ONLY -eq 1 ]]; then
     while IFS= read -r -d '' rel; do
-        scan_one "$rel"
-    done < "$LIST_OF_FILES"
+        extract_staged_path "$rel"
+    done < "$STAGED_FILES"
+    FILE_COUNT=$(tr -cd '\0' < "$STAGED_FILES" | wc -c | tr -d ' ')
+elif [[ $CHANGED_ONLY -eq 1 ]]; then
+    while IFS= read -r -d '' rel; do
+        extract_staged_path "$rel"
+    done < "$STAGED_FILES"
+    while IFS= read -r -d '' rel; do
+        extract_worktree_path "$rel"
+    done < "$WORKTREE_FILES"
     FILE_COUNT=$(tr -cd '\0' < "$LIST_OF_FILES" | wc -c | tr -d ' ')
 else
     while IFS= read -r rel; do
-        scan_one "$rel"
+        extract_worktree_path "$rel"
     done < "$LIST_OF_FILES"
     FILE_COUNT=$(wc -l < "$LIST_OF_FILES" | tr -d ' ')
 fi

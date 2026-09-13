@@ -51,6 +51,11 @@
   `dir/*.ext` (which silently skipped matching files). `--changed --language
   auto` falls back to index manifests when the worktree copy is missing, matching
   how `--changed` already includes staged sources.
+- `--changed --language auto` resolves index and worktree manifests independently
+  so a worktree-only higher-priority manifest cannot mask staged sources;
+  dotless filename wildcards such as `src/**/test_*` stay file pathspecs;
+  staged path dedup is O(n) via a hash set (and `--staged` skips membership
+  probes); staged knowledge-base symlinks are dereferenced to the target blob.
 
 ## v0.1.0 - 2026-06-23
 
