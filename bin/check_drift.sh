@@ -69,19 +69,17 @@ case "$KNOWLEDGE_BASE" in
 esac
 L1_FILE="$KNOWLEDGE_BASE"
 
-# Auto-detect language from a project manifest. In --staged mode, also accept
-# manifests that exist only in the index (worktree copy may be absent).
+# Auto-detect language from a project manifest. In --staged mode, resolve
+# exclusively from the index so a worktree-only higher-priority manifest
+# (e.g. unstaged Package.swift) cannot override staged pyproject.toml.
 manifest_present() {
     local name="$1"
-    if [ -f "$REPO_ROOT/$name" ]; then
-        return 0
+    if [[ $STAGED_ONLY -eq 1 ]]; then
+        git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+            && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null
+        return $?
     fi
-    if [[ $STAGED_ONLY -eq 1 ]] \
-        && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
-        && git -C "$REPO_ROOT" cat-file -e ":$name" 2>/dev/null; then
-        return 0
-    fi
-    return 1
+    [ -f "$REPO_ROOT/$name" ]
 }
 if [ "$LANGUAGE" = "auto" ]; then
     if manifest_present "Package.swift"; then LANGUAGE="swift"
@@ -93,17 +91,6 @@ if [ "$LANGUAGE" = "auto" ]; then
         exit 2
     fi
 fi
-
-# Resolve knowledge-base path relative to the repo (for index lookups).
-L1_REL="$KNOWLEDGE_BASE"
-case "$L1_REL" in
-    /*)
-        case "$L1_REL" in
-            "$REPO_ROOT"/*) L1_REL="${L1_REL#"$REPO_ROOT"/}" ;;
-            "$REPO_ROOT") L1_REL="." ;;
-        esac
-        ;;
-esac
 
 # Language -> file extension used for filtering and the awk symbol rules.
 case "$LANGUAGE" in
@@ -119,6 +106,8 @@ esac
 
 # Lexically normalize a path (absolute or repo-relative) and ensure it stays
 # inside REPO_ROOT. Prints a repo-relative path (or ".") on success.
+# Splits on '/' with noglob so wildcard components (e.g. packages/*/src) are
+# preserved for git pathspecs instead of expanding against the caller's cwd.
 repo_rel_or_die() {
     local raw="$1"
     local abs
@@ -129,15 +118,17 @@ repo_rel_or_die() {
     # Collapse . and .. without resolving symlinks (bash 3.2 / macOS).
     local normalized="" part
     local IFS='/'
+    set -f
     # shellcheck disable=SC2086
     set -- $abs
+    set +f
     unset IFS
     for part in "$@"; do
         case "$part" in
             ""|.) continue ;;
             ..)
                 if [[ -z "$normalized" || "$normalized" == "/" ]]; then
-                    echo "error: --source-glob must be inside the repository ($raw)" >&2
+                    echo "error: path must be inside the repository ($raw)" >&2
                     exit 2
                 fi
                 normalized="${normalized%/*}"
@@ -157,11 +148,15 @@ repo_rel_or_die() {
         "$REPO_ROOT") printf '%s\n' "." ;;
         "$REPO_ROOT"/*) printf '%s\n' "${normalized#"$REPO_ROOT"/}" ;;
         *)
-            echo "error: --source-glob must be inside the repository ($raw)" >&2
+            echo "error: path must be inside the repository ($raw)" >&2
             exit 2
             ;;
     esac
 }
+
+# Resolve knowledge-base path relative to the repo (for index lookups).
+# Normalize .. segments so git cat-file ":docs/knowledge/../knowledge/..." works.
+L1_REL="$(repo_rel_or_die "$KNOWLEDGE_BASE")"
 
 # Reject relative/absolute source globs that escape the repository before any
 # git pathspec work (including cases where the outside directory exists).
@@ -230,6 +225,22 @@ path_in_z_list() {
     return 1
 }
 
+# Unique NUL-delimited paths without `sort -z` (absent or unreliable on some
+# BSD/macOS sort builds). Failed GNU-only sort piped through `|| true` would
+# leave an empty list and silently skip every staged API.
+unique_paths_z() {
+    local out="$1" path
+    local tmp
+    tmp="$(mktemp "$WORK/unique_paths.XXXXXX")"
+    : > "$tmp"
+    while IFS= read -r -d '' path; do
+        [[ -z "$path" ]] && continue
+        path_in_z_list "$path" "$tmp" && continue
+        printf '%s\0' "$path" >> "$tmp"
+    done
+    mv "$tmp" "$out"
+}
+
 # Decide which files to scan, in --changed/--staged mode or full mode.
 if [[ $CHANGED_ONLY -eq 1 ]]; then
     if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
@@ -250,15 +261,17 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     fi
     {
         git -C "$REPO_ROOT" diff --cached -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-    } | filter_paths_z "$LANG_EXT" | sort -z -u > "$STAGED_FILES" || true
+    } | filter_paths_z "$LANG_EXT" | unique_paths_z "$STAGED_FILES"
     if [[ $STAGED_ONLY -eq 1 ]]; then
         cp "$STAGED_FILES" "$LIST_OF_FILES"
     else
         {
             git -C "$REPO_ROOT" diff -z --name-only -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
             git -C "$REPO_ROOT" ls-files -z --others --exclude-standard -- "$PATHSPEC_DIRECT" "$PATHSPEC_NESTED" 2>/dev/null || true
-        } | filter_paths_z "$LANG_EXT" | sort -z -u > "$WORKTREE_FILES" || true
-        cat "$STAGED_FILES" "$WORKTREE_FILES" | sort -z -u > "$LIST_OF_FILES"
+        } | filter_paths_z "$LANG_EXT" | unique_paths_z "$WORKTREE_FILES"
+        {
+            cat "$STAGED_FILES" "$WORKTREE_FILES"
+        } | unique_paths_z "$LIST_OF_FILES"
     fi
     if [[ ! -s "$LIST_OF_FILES" ]]; then
         echo "no changed $LANGUAGE files under $SRC_DIR_FOR_GIT; nothing to check"
@@ -286,8 +299,9 @@ fi
 # - Index/staged symbols: use the index blob. If the KB exists in HEAD but was
 #   deleted from the index, treat it as empty (do not fall back to a worktree
 #   recreation). Index-only scans never fall back to a worktree-only KB.
-# - Worktree symbols: prefer the worktree file; fall back to the index blob
-#   only when the worktree file is missing.
+# - Worktree symbols: use the worktree file; if it is missing, treat the KB as
+#   deleted (empty) rather than substituting the index copy (which would hide
+#   drift when the worktree KB was removed).
 INDEX_L1_SOURCE=""
 WORKTREE_L1_SOURCE=""
 
@@ -310,12 +324,10 @@ resolve_index_l1() {
 resolve_worktree_l1() {
     if [[ -f "$L1_FILE" ]]; then
         WORKTREE_L1_SOURCE="$L1_FILE"
-    elif git -C "$REPO_ROOT" cat-file -e ":$L1_REL" 2>/dev/null; then
-        git -C "$REPO_ROOT" show ":$L1_REL" > "$WORK/l1_worktree.md"
-        WORKTREE_L1_SOURCE="$WORK/l1_worktree.md"
     else
-        echo "error: $L1_FILE not found" >&2
-        exit 2
+        # Missing/deleted in the worktree: empty KB (do not use the index blob).
+        : > "$WORK/l1_worktree.md"
+        WORKTREE_L1_SOURCE="$WORK/l1_worktree.md"
     fi
 }
 

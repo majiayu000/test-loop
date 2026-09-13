@@ -40,6 +40,12 @@
   in an unstaged KB no longer falsely cleans); `--changed` also scans when the
   worktree source directory is absent if staged blobs remain; `--staged
   --language auto` detects language from index-only manifests.
+- Portable NUL path uniqueness replaces `sort -z -u || true` (which could leave
+  an empty staged list on sort builds without `-z`); `--staged --language auto`
+  ignores worktree-only manifests; knowledge-base paths with `..` are normalized
+  before index lookup; intermediate wildcard glob components are preserved
+  (noglob split); a missing worktree knowledge base is treated as deleted/empty
+  instead of falling back to the index blob.
 
 ## v0.1.0 - 2026-06-23
 

@@ -420,6 +420,117 @@ jobs:
           git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
           rm -f pyproject.toml
           rm -rf src
+      - name: check_drift portable sort, staged auto, KB norm, globs, deleted KB
+        # Codex review follow-ups on 3a9e67d: portable NUL uniqueness (no
+        # sort -z || true), --staged --language auto from index only,
+        # normalize KB .. segments, preserve wildcard path components, and
+        # treat a missing worktree KB as deleted (empty).
+        run: |
+          set -euo pipefail
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Portable unique_paths_z still sees staged APIs (empty-list risk).
+          mkdir -p Sources/CaffCore
+          printf 'public struct PortableSortProbe {}\n' > Sources/CaffCore/PortableSortProbe.swift
+          git add Sources/CaffCore/PortableSortProbe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'PortableSortProbe'
+          git reset HEAD -- Sources/CaffCore/PortableSortProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 2) --staged --language auto must ignore worktree-only Package.swift
+          #    when pyproject.toml is staged (index-only language resolution).
+          mkdir -p src
+          printf '[project]\nname = "tmp"\n' > pyproject.toml
+          printf 'def StagedAutoIndexOnly():\n    pass\n' > src/a.py
+          git add pyproject.toml src/a.py
+          printf '// swift package\n' > Package.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'StagedAutoIndexOnly'
+          git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
+          rm -f pyproject.toml Package.swift
+          rm -rf src
+
+          # 3) KB path with .. must still resolve the index blob.
+          mkdir -p Sources/CaffCore
+          printf 'public struct KbDotDotProbe {}\n' > Sources/CaffCore/KbDotDotProbe.swift
+          git add Sources/CaffCore/KbDotDotProbe.swift
+          # Document in the real KB and stage it so index lookup must succeed
+          # through the normalized spelling.
+          printf '\nKbDotDotProbe\n' >> "$kb"
+          git add "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base 'templates/knowledge/../knowledge/L1_modules.md' \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git checkout -- "$kb"
+          git reset HEAD -- Sources/CaffCore/KbDotDotProbe.swift "$kb" 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 4) Intermediate wildcard in --source-glob must reach git pathspecs.
+          mkdir -p packages/a/src
+          printf 'def WildcardGlobProbe():\n    pass\n' > packages/a/src/mod.py
+          git add packages/a/src/mod.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'packages/*/src/**/*.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'WildcardGlobProbe'
+          git reset HEAD -- packages/a/src/mod.py 2>/dev/null || true
+          rm -rf packages
+
+          # 5) Deleted worktree KB + unstaged source edit must not fall back
+          #    to the index KB (would falsely report clean).
+          mkdir -p Sources/CaffCore
+          printf 'public struct DeletedKbProbe {}\n' > Sources/CaffCore/DeletedKbProbe.swift
+          printf '\nDeletedKbProbe\n' >> "$kb"
+          git add "$kb"
+          rm -f "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DeletedKbProbe'
+          git checkout -- "$kb"
+          git reset HEAD -- "$kb" 2>/dev/null || true
+          rm -rf Sources/CaffCore
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
