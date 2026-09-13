@@ -56,6 +56,11 @@
   dotless filename wildcards such as `src/**/test_*` stay file pathspecs;
   staged path dedup is O(n) via a hash set (and `--staged` skips membership
   probes); staged knowledge-base symlinks are dereferenced to the target blob.
+- Slashless filename pathspecs such as `--source-glob 'test_*'` stay as file
+  pathspecs instead of broadening to repository-wide `*.ext`/`**/*.ext`; bare
+  `*.ext` still expands at the repository root. Staged knowledge-base symlink
+  chains are followed recursively (with cycle detection) to the final Markdown
+  blob before tokenizing.
 
 ## v0.1.0 - 2026-06-23
 
