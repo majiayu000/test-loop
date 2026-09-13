@@ -154,14 +154,20 @@ SRC_DIR_INPUT="$(echo "$SOURCE_GLOB_INPUT" | sed -E 's|/\*\*?[^/]*$||;s|/\*[^/]*
 SRC_DIR_REPO_REL="$(repo_rel_or_die "$SRC_DIR_INPUT")"
 
 # Pick the source directory for filesystem checks / full-mode find.
+# Index-only (--staged) scans do not require the worktree directory: the last
+# source file may be staged for deletion, or a newly staged tree may be removed
+# locally before commit.
 SRC_DIR="$(echo "$SOURCE_GLOB" | sed -E 's|/\*[^/]*$||;s|/\*\*$||')"
-if [ ! -d "$SRC_DIR" ]; then
+if [[ $STAGED_ONLY -ne 1 ]] && [ ! -d "$SRC_DIR" ]; then
     echo "error: $SRC_DIR not found" >&2
     exit 2
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# EXTRACTED stores NUL-delimited path/symbol pairs (path\0symbol\0...) so a
+# pathname containing a newline cannot split records the way path:symbol lines
+# would.
 EXTRACTED="$WORK/extracted.txt"
 LIST_OF_FILES="$WORK/files.txt"
 STAGED_FILES="$WORK/staged.txt"
@@ -277,21 +283,23 @@ if [[ $CHANGED_ONLY -eq 1 ]]; then
     fi
 fi
 
-# Per-language awk rules. Each rule prints "<rel_path>:<Name>".
+# Per-language awk rules. Each rule prints one symbol name per line.
+# The caller pairs names with the source path via NUL-delimited EXTRACTED
+# records so pathnames with embedded newlines stay unambiguous.
 emit_awk() {
     case "$LANGUAGE" in
         swift)
-            awk -v rel="$1" '
+            awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
                 /^public[[:space:]]+(struct|class|enum|protocol)[[:space:]]+[A-Z][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
-                        if ($i == "struct" || $i == "class" || $i == "enum" || $i == "protocol") { print rel ":" ident($(i+1)); break }
+                        if ($i == "struct" || $i == "class" || $i == "enum" || $i == "protocol") { print ident($(i+1)); break }
                     }
                     next
                 }
                 /^public[[:space:]]+(static[[:space:]]+)?(func|init)[[:space:]]+/ {
                     for (i = 1; i <= NF; i++) {
-                        if ($i == "func" || $i == "init") { print rel ":" ident($(i+1)); break }
+                        if ($i == "func" || $i == "init") { print ident($(i+1)); break }
                     }
                 }
             '
@@ -300,17 +308,17 @@ emit_awk() {
             # Match top-level (zero-indent) class/def and names that are not
             # private (no leading underscore). Multiline `class Foo(Bar):`
             # and `def foo(x):` are common.
-            awk -v rel="$1" '
+            awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
                 # top-level class or def (no leading whitespace)
                 /^class[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
-                        if ($i == "class") { print rel ":" ident($(i+1)); break }
+                        if ($i == "class") { print ident($(i+1)); break }
                     }
                 }
                 /^def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
-                        if ($i == "def") { print rel ":" ident($(i+1)); break }
+                        if ($i == "def") { print ident($(i+1)); break }
                     }
                 }
             '
@@ -318,24 +326,24 @@ emit_awk() {
         go)
             # Top-level func / type / var / const with an uppercase first
             # letter (Go convention for exported identifiers).
-            awk -v rel="$1" '
+            awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
                 # indented continuation lines are not declarations
                 /^[[:space:]]/ { next }
                 /^(func[[:space:]]+([A-Za-z_][A-Za-z0-9_]*[[:space:]]+)?[A-Z][A-Za-z0-9_]*|type[[:space:]]+[A-Z][A-Za-z0-9_]*|var[[:space:]]+[A-Z][A-Za-z0-9_]*|const[[:space:]]+[A-Z][A-Za-z0-9_]*)/ {
                     for (i = 1; i <= NF; i++) {
-                        if ($i == "func" || $i == "type" || $i == "var" || $i == "const") { print rel ":" ident($(i+1)); break }
+                        if ($i == "func" || $i == "type" || $i == "var" || $i == "const") { print ident($(i+1)); break }
                     }
                 }
             '
             ;;
         rust)
             # pub fn / pub struct / pub enum / pub trait / pub use.
-            awk -v rel="$1" '
+            awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
                 /pub[[:space:]]+(fn|struct|enum|trait|use|mod|type)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
-                        if ($i == "fn" || $i == "struct" || $i == "enum" || $i == "trait" || $i == "use" || $i == "mod" || $i == "type") { print rel ":" ident($(i+1)); break }
+                        if ($i == "fn" || $i == "struct" || $i == "enum" || $i == "trait" || $i == "use" || $i == "mod" || $i == "type") { print ident($(i+1)); break }
                     }
                 }
             '
@@ -343,19 +351,33 @@ emit_awk() {
     esac
 }
 
+# Append path/symbol pairs from stdin source text into EXTRACTED.
+append_extracted() {
+    local rel="$1" name
+    emit_awk | while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        printf '%s\0%s\0' "$rel" "$name" >> "$EXTRACTED"
+    done
+}
+
 scan_one() {
     local rel="$1"
     [[ -z "$rel" ]] && return 0
-    # Staged paths are scanned from the index blob so --changed/--staged
-    # match what pre-commit will commit, even when the worktree diverges.
+    # --staged always reads the index blob. Under --changed, prefer the
+    # worktree when the same path also has unstaged edits so an API added
+    # only after staging is not missed; otherwise use the index blob so a
+    # staged-only path still matches commit contents when the worktree diverges.
     if [[ $CHANGED_ONLY -eq 1 ]] && grep -F -z -x -q -- "$rel" "$STAGED_FILES" 2>/dev/null; then
-        git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
-            | emit_awk "$rel" >> "$EXTRACTED" 2>/dev/null || true
-        return 0
+        if [[ $STAGED_ONLY -eq 1 ]] \
+            || ! grep -F -z -x -q -- "$rel" "$WORKTREE_FILES" 2>/dev/null; then
+            git -C "$REPO_ROOT" show ":$rel" 2>/dev/null \
+                | append_extracted "$rel" 2>/dev/null || true
+            return 0
+        fi
     fi
     f="$REPO_ROOT/$rel"
     [[ -f "$f" ]] || return 0
-    emit_awk "$rel" < "$f" >> "$EXTRACTED" 2>/dev/null || true
+    append_extracted "$rel" < "$f" 2>/dev/null || true
 }
 
 if [[ $CHANGED_ONLY -eq 1 ]]; then
@@ -370,9 +392,17 @@ else
     FILE_COUNT=$(wc -l < "$LIST_OF_FILES" | tr -d ' ')
 fi
 
-# Sorted unique names extracted from sources.
+# Sorted unique names extracted from sources (NUL path/symbol pairs).
 EXTRACTED_NAMES="$WORK/names.txt"
-sed -E 's|^[^:]+:||' "$EXTRACTED" | sort -u > "$EXTRACTED_NAMES"
+: > "$EXTRACTED_NAMES"
+{
+    while true; do
+        IFS= read -r -d '' _rel || break
+        IFS= read -r -d '' name || break
+        [[ -z "$name" ]] && continue
+        printf '%s\n' "$name"
+    done < "$EXTRACTED"
+} | sort -u > "$EXTRACTED_NAMES"
 
 # Sorted unique identifiers appearing in L1 (strip code fences and backticks first).
 L1_NAMES="$WORK/l1_names.txt"
@@ -430,10 +460,21 @@ if [[ "$NUM_MISSING" -eq 0 ]]; then
 fi
 
 echo "drift: $NUM_MISSING public symbol(s) not in L1_modules.md or baseline:"
-# Show file:line for each missing name by joining back with EXTRACTED.
+# Show path:symbol for each missing name by joining back with EXTRACTED pairs.
 while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    grep -E ":${name}$" "$EXTRACTED" | head -3 | sed 's/^/  - /'
+    shown=0
+    while true; do
+        IFS= read -r -d '' rel || break
+        IFS= read -r -d '' sym || break
+        if [[ "$sym" == "$name" ]]; then
+            # Collapse embedded newlines in path for single-line display only.
+            safe_rel="${rel//$'\n'/\\n}"
+            printf '  - %s:%s\n' "$safe_rel" "$sym"
+            shown=$((shown + 1))
+            [[ "$shown" -ge 3 ]] && break
+        fi
+    done < "$EXTRACTED"
 done < "$MISSING"
 echo
 echo "Fix: add the symbol to docs/knowledge/L1_modules.md (or update the"

@@ -199,6 +199,73 @@ jobs:
           printf '%s\n' "$out"
           test "$rc" -eq 2
           printf '%s\n' "$out" | grep -qi 'inside the repository'
+          rm -rf Sources/CaffCore
+      - name: check_drift mixed worktree, NUL EXTRACTED, staged without dir
+        # Codex review follow-ups on 99b7c23: doubly-changed paths prefer the
+        # worktree under --changed; EXTRACTED stays NUL-safe for newline paths;
+        # --staged does not require the source directory in the worktree.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged baseline + unstaged new API on the same path.
+          printf 'public struct DoublyBase {}\n' > Sources/CaffCore/Doubly.swift
+          printf '\nDoublyBase\n' >> "$kb"
+          git add Sources/CaffCore/Doubly.swift "$kb"
+          printf 'public struct DoublyBase {}\npublic struct DoublyFresh {}\n' > Sources/CaffCore/Doubly.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DoublyFresh'
+          git reset HEAD -- Sources/CaffCore/Doubly.swift "$kb" 2>/dev/null || true
+          git checkout -- "$kb"
+          rm -f Sources/CaffCore/Doubly.swift
+
+          # 2) Newline in pathname must not invent phantom missing symbols.
+          nl_file=$'Sources/CaffCore/new\nline.swift'
+          printf 'public struct NewlineProbe {}\n' > "$nl_file"
+          printf '\nNewlineProbe\n' >> "$kb"
+          git add -A -- Sources/CaffCore "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- Sources/CaffCore "$kb" 2>/dev/null || true
+          git checkout -- "$kb"
+          rm -rf Sources/CaffCore
+
+          # 3) --staged still scans when the worktree source dir is gone.
+          mkdir -p Sources/CaffCore
+          printf 'public struct GoneDirProbe {}\n' > Sources/CaffCore/GoneDirProbe.swift
+          git add Sources/CaffCore/GoneDirProbe.swift
+          rm -rf Sources/CaffCore
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'GoneDirProbe'
+          git reset HEAD -- Sources/CaffCore/GoneDirProbe.swift 2>/dev/null || true
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
