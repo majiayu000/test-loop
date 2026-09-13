@@ -19,6 +19,683 @@ jobs:
           python-version: "3.x"
       - name: Syntax check shell scripts
         run: bash -n bin/check_drift.sh bin/render_report.sh templates/githooks/pre-commit
+      - name: check_drift --changed takes changed-only path
+        # Regression for LOGIC-01: a dead second argv parser used to reset
+        # CHANGED_ONLY=0 after the first parser had already shift'ed argv
+        # empty, so --changed always fell through to full mode. With a
+        # real source dir + knowledge base and no matching dirty files,
+        # changed-only mode must exit 0 with the "no changed … files"
+        # message (full mode would error with "no files matched").
+        run: |
+          set -euo pipefail
+          resets=$(grep -cE '^CHANGED_ONLY=0$' bin/check_drift.sh)
+          if [ "$resets" -ne 1 ]; then
+            echo "error: expected exactly one CHANGED_ONLY=0 assignment (initial default), found $resets" >&2
+            grep -nE '^CHANGED_ONLY=0$' bin/check_drift.sh >&2 || true
+            exit 1
+          fi
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'bin' \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language python)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'no changed python files'
+      - name: check_drift --changed pathspecs and staged blobs
+        # Codex review follow-ups: relative pathspecs, direct children under
+        # the source dir, and index-blob scanning for staged paths.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore/Nested
+          printf 'public struct TopLevelProbe {}\n' > Sources/CaffCore/TopLevelProbe.swift
+          printf 'public struct NestedProbe {}\n' > Sources/CaffCore/Nested/NestedProbe.swift
+          git add Sources/CaffCore/TopLevelProbe.swift Sources/CaffCore/Nested/NestedProbe.swift
+          # Drop the worktree copy so only the index blob remains for the
+          # top-level file; --changed must still see TopLevelProbe.
+          rm Sources/CaffCore/TopLevelProbe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'TopLevelProbe'
+          printf '%s\n' "$out" | grep -q 'NestedProbe'
+          # Isolate later steps: do not leave probe blobs staged in the index.
+          git reset HEAD -- Sources/CaffCore/TopLevelProbe.swift Sources/CaffCore/Nested/NestedProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+      - name: check_drift --changed root glob, staged L1, and -z paths
+        # Codex review follow-ups on beea636: accept absolute --source-glob
+        # equal to REPO_ROOT, read L1 from the index blob, and keep unusual
+        # filenames via NUL-terminated git path listing.
+        run: |
+          set -euo pipefail
+          REPO=$(pwd)
+
+          # 1) Absolute source-glob equal to REPO_ROOT must not exit 2.
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob "$REPO" \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language python)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -qE 'no changed python files|drift:|scanned'
+
+          # 2) Staged undocumented API must fail even if worktree L1 documents it.
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+          printf 'public struct StagedOnlyProbe {}\n' > Sources/CaffCore/StagedOnlyProbe.swift
+          git add Sources/CaffCore/StagedOnlyProbe.swift
+          printf '\nStagedOnlyProbe\n' >> "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'StagedOnlyProbe'
+          git checkout -- "$kb"
+
+          # 3) Unusual filename must still be scanned (--changed uses -z).
+          printf 'public struct CafeProbe {}\n' > "Sources/CaffCore/café.swift"
+          git add "Sources/CaffCore/café.swift"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base templates/knowledge/L1_modules.md \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'CafeProbe'
+          # Isolate later steps: drop staged probes and restore L1 worktree.
+          git reset HEAD -- Sources/CaffCore/StagedOnlyProbe.swift "Sources/CaffCore/café.swift" 2>/dev/null || true
+          git checkout -- "$kb"
+          rm -rf Sources/CaffCore
+      - name: check_drift staged-only, worktree L1, deleted index KB, escape
+        # Codex review follow-ups on e472247.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) --staged ignores an undocumented unstaged sibling file.
+          printf 'public struct StagedOk {}\n' > Sources/CaffCore/StagedOk.swift
+          printf 'public struct UnstagedBad {}\n' > Sources/CaffCore/UnstagedBad.swift
+          git add Sources/CaffCore/StagedOk.swift
+          printf '\nStagedOk\n' >> "$kb"
+          git add "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- "$kb" Sources/CaffCore/StagedOk.swift
+          git checkout -- "$kb"
+          rm -f Sources/CaffCore/StagedOk.swift Sources/CaffCore/UnstagedBad.swift
+
+          # 2) Unstaged API + unstaged L1 docs must compare worktree-to-worktree.
+          printf 'public struct WorktreePair {}\n' > Sources/CaffCore/WorktreePair.swift
+          printf '\nWorktreePair\n' >> "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git checkout -- "$kb"
+          rm -f Sources/CaffCore/WorktreePair.swift
+
+          # 3) Index-deleted KB must not fall back to a worktree recreation.
+          printf 'public struct DeletedKbProbe {}\n' > Sources/CaffCore/DeletedKbProbe.swift
+          git add Sources/CaffCore/DeletedKbProbe.swift
+          git rm --cached -f "$kb"
+          printf '\nDeletedKbProbe\n' > "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DeletedKbProbe'
+          git checkout HEAD -- "$kb"
+          git reset HEAD -- Sources/CaffCore/DeletedKbProbe.swift 2>/dev/null || true
+          rm -f Sources/CaffCore/DeletedKbProbe.swift
+
+          # 4) Relative ../ source-glob escape must exit 2 (not silent clean).
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob '../shared/src' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 2
+          printf '%s\n' "$out" | grep -qi 'inside the repository'
+          rm -rf Sources/CaffCore
+      - name: check_drift mixed worktree, NUL EXTRACTED, staged without dir
+        # Codex review follow-ups on 99b7c23: doubly-changed paths union index
+        # and worktree symbols under --changed; EXTRACTED stays NUL-safe for
+        # newline paths; --staged does not require the source directory in the
+        # worktree.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged baseline + unstaged new API on the same path.
+          printf 'public struct DoublyBase {}\n' > Sources/CaffCore/Doubly.swift
+          printf '\nDoublyBase\n' >> "$kb"
+          git add Sources/CaffCore/Doubly.swift "$kb"
+          printf 'public struct DoublyBase {}\npublic struct DoublyFresh {}\n' > Sources/CaffCore/Doubly.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DoublyFresh'
+          git reset HEAD -- Sources/CaffCore/Doubly.swift "$kb" 2>/dev/null || true
+          git checkout -- "$kb"
+          rm -f Sources/CaffCore/Doubly.swift
+
+          # 2) Newline in pathname must not invent phantom missing symbols.
+          nl_file=$'Sources/CaffCore/new\nline.swift'
+          printf 'public struct NewlineProbe {}\n' > "$nl_file"
+          printf '\nNewlineProbe\n' >> "$kb"
+          git add -A -- Sources/CaffCore "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- Sources/CaffCore "$kb" 2>/dev/null || true
+          git checkout -- "$kb"
+          rm -rf Sources/CaffCore
+
+          # 3) --staged still scans when the worktree source dir is gone.
+          mkdir -p Sources/CaffCore
+          printf 'public struct GoneDirProbe {}\n' > Sources/CaffCore/GoneDirProbe.swift
+          git add Sources/CaffCore/GoneDirProbe.swift
+          rm -rf Sources/CaffCore
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'GoneDirProbe'
+          git reset HEAD -- Sources/CaffCore/GoneDirProbe.swift 2>/dev/null || true
+      - name: check_drift portable membership, slashless glob, staged KB, union
+        # Codex review follow-ups on 408e254: portable NUL membership (no
+        # grep -z), slashless root --source-glob, refuse worktree-only KB in
+        # --staged, and union both snapshots for doubly-changed paths.
+        run: |
+          set -euo pipefail
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Slashless root glob '*.py' must scan repo-root python paths.
+          printf 'def RootGlobProbe():\n    pass\n' > RootGlobProbe.py
+          git add RootGlobProbe.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob '*.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'RootGlobProbe'
+          printf '%s\n' "$out" | grep -qv 'under \*\.py'
+          git reset HEAD -- RootGlobProbe.py 2>/dev/null || true
+          rm -f RootGlobProbe.py
+
+          # 2) --staged must not treat a worktree-only KB as documenting APIs.
+          mkdir -p Sources/CaffCore
+          printf 'public struct WorktreeKbProbe {}\n' > Sources/CaffCore/WorktreeKbProbe.swift
+          git add Sources/CaffCore/WorktreeKbProbe.swift
+          WORK_KB=$(mktemp)
+          printf '# worktree-only KB\n\nWorktreeKbProbe\n' > "$WORK_KB"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$WORK_KB" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'WorktreeKbProbe'
+          rm -f "$WORK_KB"
+          git reset HEAD -- Sources/CaffCore/WorktreeKbProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 3) Doubly-changed path: staged undocumented API + worktree without it.
+          mkdir -p Sources/CaffCore
+          printf 'public struct UnionBase {}\npublic struct UnionStagedOnly {}\n' > Sources/CaffCore/Union.swift
+          git add Sources/CaffCore/Union.swift
+          printf 'public struct UnionBase {}\n' > Sources/CaffCore/Union.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'UnionStagedOnly'
+          git reset HEAD -- Sources/CaffCore/Union.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 4) Portable membership still sees staged-only index blobs.
+          mkdir -p Sources/CaffCore
+          printf 'public struct MembershipProbe {}\n' > Sources/CaffCore/MembershipProbe.swift
+          git add Sources/CaffCore/MembershipProbe.swift
+          rm Sources/CaffCore/MembershipProbe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'MembershipProbe'
+          git reset HEAD -- Sources/CaffCore/MembershipProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+      - name: check_drift dual KB, changed without dir, staged auto lang
+        # Codex review follow-ups on 22c0a90: pair each origin with its KB,
+        # allow --changed when the worktree source dir is gone, and resolve
+        # --staged --language auto from index-only manifests.
+        run: |
+          set -euo pipefail
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged undocumented API + worktree restored + name only in
+          #    unstaged KB must still report drift (index symbols vs index KB).
+          mkdir -p Sources/CaffCore
+          printf 'public struct DualKbBase {}\npublic struct DualKbStaged {}\n' > Sources/CaffCore/DualKb.swift
+          git add Sources/CaffCore/DualKb.swift
+          printf 'public struct DualKbBase {}\n' > Sources/CaffCore/DualKb.swift
+          printf '\nDualKbStaged\n' >> "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DualKbStaged'
+          git checkout -- "$kb"
+          git reset HEAD -- Sources/CaffCore/DualKb.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 2) --changed must scan staged blobs when the source dir is gone.
+          mkdir -p Sources/CaffCore
+          printf 'public struct ChangedGoneDir {}\n' > Sources/CaffCore/ChangedGoneDir.swift
+          git add Sources/CaffCore/ChangedGoneDir.swift
+          rm -rf Sources/CaffCore
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'ChangedGoneDir'
+          git reset HEAD -- Sources/CaffCore/ChangedGoneDir.swift 2>/dev/null || true
+
+          # 3) --staged --language auto must see an index-only pyproject.toml.
+          mkdir -p src
+          printf '[project]\nname = "tmp"\n' > pyproject.toml
+          printf 'def AutoLangProbe():\n    pass\n' > src/a.py
+          git add pyproject.toml src/a.py
+          rm -f pyproject.toml
+          rm -rf src
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'AutoLangProbe'
+          git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
+          rm -f pyproject.toml
+          rm -rf src
+      - name: check_drift portable sort, staged auto, KB norm, globs, deleted KB
+        # Codex review follow-ups: portable NUL uniqueness, dual-snapshot
+        # --changed --language auto, normalize KB .. segments, preserve
+        # wildcard path components (including dotless filename globs), treat a
+        # missing worktree KB as deleted, and dereference staged KB symlinks.
+        run: |
+          set -euo pipefail
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Portable unique_paths_z still sees staged APIs (empty-list risk).
+          mkdir -p Sources/CaffCore
+          printf 'public struct PortableSortProbe {}\n' > Sources/CaffCore/PortableSortProbe.swift
+          git add Sources/CaffCore/PortableSortProbe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'PortableSortProbe'
+          git reset HEAD -- Sources/CaffCore/PortableSortProbe.swift 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 2) --staged --language auto must ignore worktree-only Package.swift
+          #    when pyproject.toml is staged (index-only language resolution).
+          mkdir -p src
+          printf '[project]\nname = "tmp"\n' > pyproject.toml
+          printf 'def StagedAutoIndexOnly():\n    pass\n' > src/a.py
+          git add pyproject.toml src/a.py
+          printf '// swift package\n' > Package.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'StagedAutoIndexOnly'
+          git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
+          rm -f pyproject.toml Package.swift
+          rm -rf src
+
+          # 3) KB path with .. must still resolve the index blob.
+          mkdir -p Sources/CaffCore
+          printf 'public struct KbDotDotProbe {}\n' > Sources/CaffCore/KbDotDotProbe.swift
+          git add Sources/CaffCore/KbDotDotProbe.swift
+          # Document in the real KB and stage it so index lookup must succeed
+          # through the normalized spelling.
+          printf '\nKbDotDotProbe\n' >> "$kb"
+          git add "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base 'templates/knowledge/../knowledge/L1_modules.md' \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git checkout -- "$kb"
+          git reset HEAD -- Sources/CaffCore/KbDotDotProbe.swift "$kb" 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 4) Intermediate wildcard in --source-glob must reach git pathspecs.
+          mkdir -p packages/a/src
+          printf 'def WildcardGlobProbe():\n    pass\n' > packages/a/src/mod.py
+          git add packages/a/src/mod.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'packages/*/src/**/*.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'WildcardGlobProbe'
+          git reset HEAD -- packages/a/src/mod.py 2>/dev/null || true
+          rm -rf packages
+
+          # 5) Deleted worktree KB + unstaged source edit must not fall back
+          #    to the index KB (would falsely report clean).
+          mkdir -p Sources/CaffCore
+          printf 'public struct DeletedKbProbe {}\n' > Sources/CaffCore/DeletedKbProbe.swift
+          printf '\nDeletedKbProbe\n' >> "$kb"
+          git add "$kb"
+          rm -f "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DeletedKbProbe'
+          git checkout -- "$kb"
+          git reset HEAD -- "$kb" 2>/dev/null || true
+          rm -rf Sources/CaffCore
+
+          # 6) Filename-specific --source-glob must not become dir/*.ext.
+          mkdir -p src
+          printf 'def FileGlobProbe():\n    pass\n' > src/api.py
+          git add src/api.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src/api.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'FileGlobProbe'
+          printf 'def FileGlobStarProbe():\n    pass\n' > src/test_x.py
+          git add src/test_x.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src/test_*.py' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'FileGlobStarProbe'
+          git reset HEAD -- src/api.py src/test_x.py 2>/dev/null || true
+          rm -rf src
+
+          # 7) --changed --language auto must consult index-only manifests.
+          mkdir -p src
+          printf 'def ChangedAutoProbe():\n    pass\n' > src/a.py
+          printf '[project]\nname = "probe"\n' > pyproject.toml
+          git add src/a.py pyproject.toml
+          rm -f pyproject.toml
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'ChangedAutoProbe'
+          git reset HEAD -- src/a.py pyproject.toml 2>/dev/null || true
+          rm -rf src
+          rm -f pyproject.toml
+
+          # 8) --changed --language auto must not let a worktree-only higher
+          #    priority manifest (Package.swift) mask staged Python sources.
+          mkdir -p src
+          printf '[project]\nname = "probe"\n' > pyproject.toml
+          printf 'def ChangedAutoDualProbe():\n    pass\n' > src/a.py
+          git add pyproject.toml src/a.py
+          printf '// swift package\n' > Package.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src' \
+            --knowledge-base "$kb" \
+            --language auto 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'ChangedAutoDualProbe'
+          git reset HEAD -- pyproject.toml src/a.py 2>/dev/null || true
+          rm -f pyproject.toml Package.swift
+          rm -rf src
+
+          # 9) Dotless filename wildcards (src/**/test_*) must stay file
+          #    pathspecs, not become dir/*.ext.
+          mkdir -p src/unit
+          printf 'def DotlessGlobProbe():\n    pass\n' > src/unit/test_api.py
+          git add src/unit/test_api.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --changed \
+            --source-glob 'src/**/test_*' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'DotlessGlobProbe'
+          git reset HEAD -- src/unit/test_api.py 2>/dev/null || true
+          rm -rf src
+
+          # 10) Staged knowledge-base symlink must be dereferenced to the
+          #     target Markdown blob (not the symlink pathname).
+          mkdir -p Sources/CaffCore docs/knowledge
+          printf 'public struct SymlinkKbProbe {}\n' > Sources/CaffCore/SymlinkKbProbe.swift
+          printf 'SymlinkKbProbe\n' > docs/knowledge/L1_symlink_target.md
+          ln -sf L1_symlink_target.md docs/knowledge/L1_symlink.md
+          git add Sources/CaffCore/SymlinkKbProbe.swift \
+            docs/knowledge/L1_symlink_target.md docs/knowledge/L1_symlink.md
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base 'docs/knowledge/L1_symlink.md' \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- Sources/CaffCore/SymlinkKbProbe.swift \
+            docs/knowledge/L1_symlink_target.md docs/knowledge/L1_symlink.md \
+            2>/dev/null || true
+          rm -rf Sources/CaffCore docs/knowledge/L1_symlink_target.md \
+            docs/knowledge/L1_symlink.md
+
+          # 11) Slashless filename pathspec 'test_*' must not broaden to
+          #     repository-wide *.$ext/**/*.$ext (unrelated files stay unscanned).
+          printf 'def SlashlessGlobProbe():\n    pass\n' > test_slashless.py
+          printf 'def UnrelatedSlashless():\n    pass\n' > unrelated.py
+          git add test_slashless.py unrelated.py
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'test_*' \
+            --knowledge-base "$kb" \
+            --language python 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q 'SlashlessGlobProbe'
+          printf '%s\n' "$out" | grep -qv 'UnrelatedSlashless'
+          git reset HEAD -- test_slashless.py unrelated.py 2>/dev/null || true
+          rm -f test_slashless.py unrelated.py
+
+          # 12) Chained staged KB symlinks (kb -> middle -> target) must resolve
+          #     to the final Markdown document before tokenizing.
+          mkdir -p Sources/CaffCore docs/knowledge
+          printf 'public struct ChainKbProbe {}\n' > Sources/CaffCore/ChainKbProbe.swift
+          printf 'ChainKbProbe\n' > docs/knowledge/L1_chain_target.md
+          ln -sf L1_chain_target.md docs/knowledge/L1_chain_middle.md
+          ln -sf L1_chain_middle.md docs/knowledge/L1_chain.md
+          git add Sources/CaffCore/ChainKbProbe.swift \
+            docs/knowledge/L1_chain_target.md docs/knowledge/L1_chain_middle.md \
+            docs/knowledge/L1_chain.md
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base 'docs/knowledge/L1_chain.md' \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 0
+          printf '%s\n' "$out" | grep -q 'drift: clean'
+          git reset HEAD -- Sources/CaffCore/ChainKbProbe.swift \
+            docs/knowledge/L1_chain_target.md docs/knowledge/L1_chain_middle.md \
+            docs/knowledge/L1_chain.md 2>/dev/null || true
+          rm -rf Sources/CaffCore docs/knowledge/L1_chain_target.md \
+            docs/knowledge/L1_chain_middle.md docs/knowledge/L1_chain.md
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
