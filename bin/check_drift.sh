@@ -343,7 +343,11 @@ def on_walk_error(err):
 
 
 def pattern_dir_parts(pat, prefix):
-    """Directory segments after the literal prefix (excludes final file glob)."""
+    """Directory segments after the literal prefix (excludes final file glob).
+
+    A trailing ``**`` is itself a traversal segment (e.g. ``src/**``), not a
+    filename pattern, so it is retained for the fail-closed probe.
+    """
     if pat == prefix:
         return []
     if prefix in ("", os.sep):
@@ -357,6 +361,8 @@ def pattern_dir_parts(pat, prefix):
     parts = [p for p in rel.split(os.sep) if p]
     if not parts:
         return []
+    if parts[-1] == "**":
+        return parts
     return parts[:-1]
 
 
@@ -382,10 +388,13 @@ def probe_reachable(base, dir_parts):
         return
     part, rest = dir_parts[0], dir_parts[1:]
     if part == "**":
-        for _dirpath, _dirnames, _filenames in os.walk(
+        # glob.glob recursive listing skips leading-dot names unless a later
+        # segment names them explicitly; prune the same way so unreadable
+        # implicit-hidden trees do not false-fail the probe.
+        for _dirpath, dirnames, _filenames in os.walk(
             base, onerror=on_walk_error, followlinks=True
         ):
-            pass
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         return
     for entry in entries:
         try:

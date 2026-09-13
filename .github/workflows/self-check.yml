@@ -123,7 +123,53 @@ jobs:
             echo "expected expansion failure on unreadable subtree" >&2
             exit 1
           fi
+          # Trailing ** (no filename segment) must also fail closed.
+          if bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/**" \
+            --knowledge-base "$FIXTURE/docs/knowledge"; then
+            chmod 755 "$FIXTURE/src/locked" || true
+            echo "expected expansion failure on trailing ** unreadable subtree" >&2
+            exit 1
+          fi
           chmod 755 "$FIXTURE/src/locked"
+          rm -rf "$FIXTURE/src/locked"
+          # Unreadable dirs under implicit leading-dot trees must not fail:
+          # glob.glob skips those components unless the pattern names them.
+          mkdir -p "$FIXTURE/src/.hidden/locked"
+          cat > "$FIXTURE/src/.hidden/locked/x.py" <<'PY'
+          class HiddenLocked:
+              pass
+          PY
+          chmod 000 "$FIXTURE/src/.hidden/locked"
+          bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/**/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"
+          chmod 755 "$FIXTURE/src/.hidden/locked" || true
+          rm -rf "$FIXTURE/src/.hidden"
+          # Explicit leading-dot segment before ** must still probe that tree.
+          mkdir -p "$FIXTURE/src/.generated/locked"
+          cat > "$FIXTURE/src/.generated/ok.py" <<'PY'
+          class GeneratedOk:
+              pass
+          PY
+          cat > "$FIXTURE/src/.generated/locked/miss.py" <<'PY'
+          class GeneratedLocked:
+              pass
+          PY
+          echo "GeneratedOk" >> "$FIXTURE/docs/knowledge/api.md"
+          chmod 000 "$FIXTURE/src/.generated/locked"
+          if bin/check_drift.sh \
+            --language python \
+            --source-glob "$FIXTURE/src/.generated/**/*.py" \
+            --knowledge-base "$FIXTURE/docs/knowledge"; then
+            chmod 755 "$FIXTURE/src/.generated/locked" || true
+            echo "expected fail-closed on explicit .generated/** unreadable subtree" >&2
+            exit 1
+          fi
+          chmod 755 "$FIXTURE/src/.generated/locked" || true
+          rm -rf "$FIXTURE/src/.generated"
           # --changed must ignore hidden paths that full-mode glob excludes.
           # Fixture must live inside this git work tree so ls-files can see it.
           HFIX="$(mktemp -d "$PWD/ci-drift-XXXXXX")"
