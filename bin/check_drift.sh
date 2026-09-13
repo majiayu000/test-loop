@@ -155,8 +155,18 @@ repo_rel_or_die() {
 }
 
 # Resolve knowledge-base path relative to the repo (for index lookups).
-# Normalize .. segments so git cat-file ":docs/knowledge/../knowledge/..." works.
-L1_REL="$(repo_rel_or_die "$KNOWLEDGE_BASE")"
+# Normalize .. segments when the path is inside REPO_ROOT so git cat-file
+# ":docs/knowledge/../knowledge/..." resolves. Absolute paths outside the
+# repository (e.g. a mktemp worktree-only KB) are left unchanged so index
+# lookups miss and staged mode treats them as empty.
+case "$KNOWLEDGE_BASE" in
+    "$REPO_ROOT"|"$REPO_ROOT"/*)
+        L1_REL="$(repo_rel_or_die "$KNOWLEDGE_BASE")"
+        ;;
+    *)
+        L1_REL="$KNOWLEDGE_BASE"
+        ;;
+esac
 
 # Reject relative/absolute source globs that escape the repository before any
 # git pathspec work (including cases where the outside directory exists).
