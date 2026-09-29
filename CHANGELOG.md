@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Swift type extraction allows one optional `final` between `public` and
+  `struct`, `class`, `enum`, or `protocol`, so `public final class` is no
+  longer skipped (LOGIC-04). A staged file whose only such declaration now
+  exits 1 when the name is absent from the knowledge base. Self-check covers
+  that fail-open file and a documented sibling `public struct`.
 - `bin/check_drift.sh --changed` now keeps the first parser's `CHANGED_ONLY=1`
   value. A dead second argument-parsing block had reset `CHANGED_ONLY=0` after
   `shift` emptied argv, so changed-only mode never activated (LOGIC-01). The
