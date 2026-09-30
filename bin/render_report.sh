@@ -67,14 +67,13 @@ case "$LANGUAGE" in
         ;;
     python)
         # pytest short summary lines are "FAILED test_module.py::test_name".
-        # The full per-test lines are "test_module.py F" etc. We treat each
-        # FAILED summary line as one failing test (and let classify handle
-        # dedup).
+        # Use the final run summary for counts: quiet logs omit PASSED lines
+        # and FAILED short-summary lines may repeat.
         TEST_LINE_RX='^(FAILED|PASSED) '
         PASS_LINE_RX='^PASSED '
         FAIL_LINE_RX='^FAILED '
         FAIL_NAME_RX='^FAILED [^:]+::(.+)$'
-        RUN_LINE_RX='[0-9]+ (passed|failed) in '
+        RUN_LINE_RX='^[=[:space:]]*[0-9]+ [[:alpha:]]+(, [0-9]+ [[:alpha:]]+)* in '
         ;;
     go)
         # go test verbose:
@@ -113,15 +112,37 @@ else
     SWIFT_EXIT=0
 fi
 
+# Pull out the final run-summary line. Swift may prefix it with a check mark.
+RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | tail -1 | sed -E 's/^[✔✘] //' || true)
+
 TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
 PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
 FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
+if [[ "$LANGUAGE" == "python" && -n "$RUN_LINE" ]]; then
+    read -r PASSED FAILED <<< "$(awk '
+        {
+            passed = failed = 0
+            for (i = 1; i < NF; i++) {
+                if ($(i + 1) ~ /^passed,?$/) passed = $i
+                if ($(i + 1) ~ /^failed,?$/) failed = $i
+            }
+            print passed, failed
+        }
+    ' <<< "$RUN_LINE")"
+    TOTAL=$((PASSED + FAILED))
+fi
 
 # Pull out the failing test names for the report. macOS ships bash 3.2 (no mapfile),
 # so use a temp file and a here-string read loop.
 FAILING_TESTS_TMP="$(mktemp)"
 trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
-grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
+grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" | awk -v language="$LANGUAGE" '
+    language == "python" {
+        sub(/ - .*/, "")
+        if (seen[$0]++) next
+    }
+    { print }
+' > "$FAILING_TESTS_TMP" || true
 FAILING_TESTS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && FAILING_TESTS+=("$line")
@@ -143,11 +164,6 @@ else
     echo '{"failures": [], "failures_by_class": {}, "failures_grouped": {}, "classify_error": true}' > "$CLASSIFY_FILE"
 fi
 
-# Try to extract the run-summary line. swift test may print it as either
-#   "Test run with 74 tests passed after 0.005 seconds."
-# or, when stderr is interleaved,
-#   "✔ Test run with 74 tests passed after 0.005 seconds."
-RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | tail -1 | sed -E 's/^[✔✘] //' || true)
 [[ -z "$RUN_LINE" ]] && RUN_LINE="(no summary line found)"
 
 # Write a small JSON summary. Use python3 for safe JSON encoding.
