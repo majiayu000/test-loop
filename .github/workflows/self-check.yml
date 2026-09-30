@@ -828,6 +828,9 @@ jobs:
           cases = [
               ("stdout", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-s", (1, 1, 0), []),
               ("stdout-quiet", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-q -s", (1, 1, 0), []),
+              ("warnings", "import warnings\ndef test_output():\n    warnings.warn('one warning')\n", "-q", (1, 1, 0), []),
+              ("warnings-stdout", "import warnings\ndef test_output():\n    print('\\n10 passed in 0.50s')\n"
+               + "    warnings.warn('one warning')\n", "-q -s", (1, 1, 0), []),
               ("bytes", "import os\ndef test_output():\n    os.write(1, b'\\xff\\n')\n", "-q -s", (1, 1, 0), []),
               ("ids", "import pytest\n@pytest.mark.parametrize('x', [1, 2], ids=['a] - b', 'a] - c'])\n"
                + "def test_output(x):\n    raise AssertionError('whoops] - tail')\n", "-q", (2, 0, 2),
@@ -840,6 +843,8 @@ jobs:
                   (repo / "test_boundary.py").write_text(test_source)
                   command = shlex.quote(sys.executable) + " -m pytest --color=no " + flags
                   command += " test_boundary.py"
+                  if label.startswith("warnings"):
+                      command += "; echo cleanup"
                   run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", "--test-command", command],
                                        cwd=repo, capture_output=True, env=os.environ | {"CI": "true"})
                   artifacts = repo / "docs/reports" / day
@@ -856,6 +861,9 @@ jobs:
                       report = (artifacts / "report.md").read_text()
                       classified = json.loads((artifacts / "classify.json").read_text())
                       assert tuple(summary[k] for k in ("total", "passed", "failed")) == counts, (label, mode, summary)
+                      if label.startswith("warnings"):
+                          assert re.match(r"^1 passed, 1 warning in ", summary["run_line"]), (label, mode, summary)
+                          assert raw.endswith(b"cleanup\n")
                       assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == names
                       assert classified["failures"] == names and not summary.get("classify_error")
                       assert summary["exit_code"] == run.returncode

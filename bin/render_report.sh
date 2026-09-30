@@ -174,9 +174,10 @@ for i, line in enumerate(lines):
         run_failed.add(name)
         failing_names.setdefault(name, None)
     # Non-quiet pytest decorates its summary. Quiet summaries follow progress
-    # or short-summary details, or terminate the log. Test stdout before
-    # progress (notably with -s) is not a run summary.
+    # or the warnings footer, or short-summary details, or terminate the log.
+    # Test stdout before progress (notably with -s) is not a run summary.
     summary_position = line.startswith("=") or in_short_summary or i == last_line or (
+        i > 0 and lines[i - 1].startswith("-- Docs: https://docs.pytest.org/")) or (
         not in_session and (not has_runner_output or
                             (i > 0 and re.match(progress_rx, lines[i - 1]))))
     if not in_details and summary_position and re.match(r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in ", line):
