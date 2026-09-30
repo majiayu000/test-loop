@@ -163,6 +163,18 @@ def pytest_node_id(text: str, headlines=()) -> str:
 progress_rx = r"^(?:.*\.py\s+)?[.FEsxX]+(?:\s+\[\s*\d+%\])?\s*$"
 has_runner_output = any(re.match(progress_rx, line) or
                         re.match(r"^=+ test session starts =+$", line) for line in lines)
+summary_rx = r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in "
+# Progress is written before fixture teardown. Only the final summary-shaped
+# line before the next run's progress or session banner can end that run.
+terminal_summaries = set()
+seen_summary = False
+for i in range(len(lines) - 1, -1, -1):
+    if re.match(progress_rx, lines[i]) or re.match(r"^=+ test session starts =+$", lines[i]):
+        seen_summary = False
+    if re.match(summary_rx, lines[i]):
+        if not seen_summary:
+            terminal_summaries.add(i)
+        seen_summary = True
 last_line = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
 failing_names = {}
 passed = failed = 0
@@ -170,8 +182,10 @@ run_passed, run_failed = set(), set()
 summaries = []
 in_details = False
 in_short_summary = False
-previous_nonempty = ""
+after_progress = False
 for i, line in enumerate(lines):
+    if re.match(progress_rx, line):
+        after_progress = True
     if re.match(r"^=+ (test session starts|FAILURES|ERRORS) =+$", line):
         passed += len(run_passed)
         failed += len(run_failed)
@@ -179,6 +193,7 @@ for i, line in enumerate(lines):
         run_failed.clear()
         in_details = False
         in_short_summary = False
+        after_progress = False
     if re.match(r"^=+ (FAILURES|ERRORS) =+$", line):
         in_details = True
     if re.match(r"^=+ short test summary info =+$", line):
@@ -193,10 +208,10 @@ for i, line in enumerate(lines):
     # Decoration alone is also valid test stdout. Both quiet and decorated
     # summaries follow terminal progress, the warnings footer, or failure
     # details. Standalone summary-only logs retain their existing fallback.
-    summary_position = in_short_summary or i == last_line or (
-        i > 0 and lines[i - 1].startswith("-- Docs: https://docs.pytest.org/")) or (
-        re.match(progress_rx, previous_nonempty)) or not has_runner_output
-    if not in_details and summary_position and re.match(r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in ", line):
+    summary_position = not has_runner_output or (i in terminal_summaries and (
+        in_short_summary or i == last_line or after_progress or (
+        i > 0 and lines[i - 1].startswith("-- Docs: https://docs.pytest.org/"))))
+    if not in_details and summary_position and re.match(summary_rx, line):
         counts = dict((status, int(count)) for count, status in
                       re.findall(r"(\d+) (passed|failed)\b", line))
         # A quiet passing run has no session banner. Retain failures from
@@ -207,8 +222,7 @@ for i, line in enumerate(lines):
         run_failed.clear()
         summaries.append(line)
         in_short_summary = False
-    if line.strip():
-        previous_nonempty = line
+        after_progress = False
 passed += len(run_passed)
 failed += len(run_failed)
 print(passed, failed)
