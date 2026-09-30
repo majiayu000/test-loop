@@ -828,6 +828,12 @@ jobs:
           cases = [
               ("stdout", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-s", (1, 1, 0), []),
               ("stdout-quiet", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-q -s", (1, 1, 0), []),
+              ("decorated-stdout", "def test_output():\n    print('\\n================ 10 passed in 0.50s ================')\n",
+               "-s", (1, 1, 0), []),
+              ("decorated-stdout-quiet", "def test_output():\n    print('\\n================ 10 passed in 0.50s ================')\n",
+               "-q -s", (1, 1, 0), []),
+              ("decorated-captured", "def test_output():\n    print('================ 10 passed in 0.50s ================')\n"
+               + "    assert False\n", "-q", (1, 0, 1), ["test_boundary.py::test_output"]),
               ("warnings", "import warnings\ndef test_output():\n    warnings.warn('one warning')\n", "-q", (1, 1, 0), []),
               ("warnings-stdout", "import warnings\ndef test_output():\n    print('\\n10 passed in 0.50s')\n"
                + "    warnings.warn('one warning')\n", "-q -s", (1, 1, 0), []),
@@ -902,6 +908,42 @@ jobs:
                           if mode == "live":
                               assert run.returncode == 3
                           print(f"PASS: degraded {breakage} failed={failed} ({mode})")
+              for mode in ("collect", "live"):
+                  with tempfile.TemporaryDirectory() as temp:
+                      repo = Path(temp)
+                      shutil.copytree(source / "bin", repo / "bin")
+                      classifier = repo / "bin/classify_failures.py"
+                      if breakage == "missing":
+                          classifier.unlink()
+                      elif breakage == "syntax":
+                          classifier.write_text("invalid syntax !\n")
+                      else:
+                          classifier.write_text("raise RuntimeError('import failure')\n")
+                      node = "tests/a - b/test_a.py::test_value[a] - b]"
+                      log = ("___________________ test_value[a] - b] ___________________\n"
+                             + "FAILED " + node + " - AssertionError: whoops] - tail\n"
+                             + "FAILED " + node + " - AssertionError: other] - tail\n"
+                             + "1 failed in 0.01s\n").encode()
+                      artifacts = repo / "docs/reports" / day
+                      artifacts.mkdir(parents=True)
+                      if mode == "collect":
+                          (artifacts / "log.txt").write_bytes(log)
+                          args = ["--collect"]
+                      else:
+                          (repo / "input.log").write_bytes(log)
+                          args = ["--test-command", "cat input.log; exit 3"]
+                      run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", *args],
+                                           cwd=repo, capture_output=True)
+                      summary = json.loads((artifacts / "summary.json").read_text())
+                      report = (artifacts / "report.md").read_text()
+                      assert summary["classify_error"] and summary["exit_code"] == run.returncode
+                      assert tuple(summary[k] for k in ("total", "passed", "failed")) == (1, 0, 1)
+                      assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == [node]
+                      assert (artifacts / "classify.err").stat().st_size and b"classify_failures.py failed" in run.stderr
+                      assert (artifacts / "log.txt").read_bytes() == log
+                      if mode == "live":
+                          assert run.returncode == 3
+                      print(f"PASS: degraded duplicate {breakage} ({mode})")
           PY
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test

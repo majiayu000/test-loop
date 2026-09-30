@@ -129,27 +129,48 @@ fi
 FAILING_TESTS_TMP="$(mktemp)"
 trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
 if [[ "$LANGUAGE" == "python" ]]; then
-    PYTEST_REPORT=$(python3 - "$LOG_FILE" "$CLASSIFY_FILE" <<'PY'
-import json
+    PYTEST_REPORT=$(python3 - "$LOG_FILE" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-# Classification already ran at its guarded boundary. Counting and rendering
-# still work from the raw log when that call produced a degraded result.
-names = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))["failures"]
 log = Path(sys.argv[1]).read_text(encoding="utf-8", errors="backslashreplace")
 lines = log.splitlines()
+headlines = re.findall(r"^_+ (.+?) _+$", log, re.MULTILINE)
+
+# Node IDs are log facts even when classification is unavailable.
+def pytest_node_id(text: str, headlines=()) -> str:
+    """Remove the assertion trailer while preserving the complete node ID."""
+    path, separator, test = text.partition("::")
+    if not separator:
+        return text.split(" - ", 1)[0]
+    # Failure headlines give the complete test name even when its parameter
+    # ID contains delimiters. Use that evidence before inspecting the trailer.
+    for headline in sorted(headlines, key=len, reverse=True):
+        if test == headline or test.startswith(headline + " - "):
+            return path + separator + headline
+    if "[" in test.split(" - ", 1)[0]:
+        # The reason begins with an assertion or exception label; a later
+        # closing bracket in arbitrary reason text does not end the node ID.
+        trailer = re.search(r"\] - (?=assert\b|[\w.]+(?::|$))", test)
+        if trailer:
+            test = test[:trailer.start() + 1]
+    else:
+        test = test.split(" - ", 1)[0]
+    return path + separator + test
+
+
 progress_rx = r"^(?:.*\.py\s+)?[.FEsxX]+(?:\s+\[\s*\d+%\])?\s*$"
 has_runner_output = any(re.match(progress_rx, line) or
                         re.match(r"^=+ test session starts =+$", line) for line in lines)
 last_line = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
-failing_names = dict.fromkeys(names)
+failing_names = {}
 passed = failed = 0
 run_passed, run_failed = set(), set()
 summaries = []
 in_details = False
-in_session = in_short_summary = False
+in_short_summary = False
+previous_nonempty = ""
 for i, line in enumerate(lines):
     if re.match(r"^=+ (test session starts|FAILURES|ERRORS) =+$", line):
         passed += len(run_passed)
@@ -158,8 +179,6 @@ for i, line in enumerate(lines):
         run_failed.clear()
         in_details = False
         in_short_summary = False
-    if re.match(r"^=+ test session starts =+$", line):
-        in_session = True
     if re.match(r"^=+ (FAILURES|ERRORS) =+$", line):
         in_details = True
     if re.match(r"^=+ short test summary info =+$", line):
@@ -168,18 +187,15 @@ for i, line in enumerate(lines):
     if line.startswith("PASSED "):
         run_passed.add(line[7:])
     if line.startswith("FAILED "):
-        raw_name = line[7:]
-        name = max((name for name in names if raw_name == name or
-                    raw_name.startswith(name + " - ")), key=len, default=raw_name)
+        name = pytest_node_id(line[7:], headlines)
         run_failed.add(name)
         failing_names.setdefault(name, None)
-    # Non-quiet pytest decorates its summary. Quiet summaries follow progress
-    # or the warnings footer, or short-summary details, or terminate the log.
-    # Test stdout before progress (notably with -s) is not a run summary.
-    summary_position = line.startswith("=") or in_short_summary or i == last_line or (
+    # Decoration alone is also valid test stdout. Both quiet and decorated
+    # summaries follow terminal progress, the warnings footer, or failure
+    # details. Standalone summary-only logs retain their existing fallback.
+    summary_position = in_short_summary or i == last_line or (
         i > 0 and lines[i - 1].startswith("-- Docs: https://docs.pytest.org/")) or (
-        not in_session and (not has_runner_output or
-                            (i > 0 and re.match(progress_rx, lines[i - 1]))))
+        re.match(progress_rx, previous_nonempty)) or not has_runner_output
     if not in_details and summary_position and re.match(r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in ", line):
         counts = dict((status, int(count)) for count, status in
                       re.findall(r"(\d+) (passed|failed)\b", line))
@@ -190,7 +206,9 @@ for i, line in enumerate(lines):
         run_passed.clear()
         run_failed.clear()
         summaries.append(line)
-        in_session = in_short_summary = False
+        in_short_summary = False
+    if line.strip():
+        previous_nonempty = line
 passed += len(run_passed)
 failed += len(run_failed)
 print(passed, failed)
