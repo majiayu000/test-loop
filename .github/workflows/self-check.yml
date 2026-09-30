@@ -737,6 +737,22 @@ jobs:
               ("path-delimiter", "FAILED tests/a - b/test_params.py::test_value - assert False\n"
                + "FAILED tests/a - c/test_params.py::test_value - assert False\n2 failed in 0.01s\n",
                (2, 0, 2), ["tests/a - b/test_params.py::test_value", "tests/a - c/test_params.py::test_value"]),
+              ("closing-bracket-id", "FAILED test_params.py::test_value[a] - b] - assert False\n" * 2
+               + "FAILED test_params.py::test_value[a] - c] - assert False\n2 failed in 0.01s\n",
+               (2, 0, 2), ["test_params.py::test_value[a] - b]", "test_params.py::test_value[a] - c]"]),
+              ("incomplete-then-pass", "FAILED first/test_api.py::test_z - AssertionError\n2 passed in 0.02s\n",
+               (3, 2, 1), ["first/test_api.py::test_z"]),
+              ("pass-then-incomplete", "2 passed in 0.02s\n" + failure.format("test_z") * 2,
+               (3, 2, 1), ["test_example.py::test_z"]),
+              ("session-boundary", "FAILED first/test_api.py::test_z - AssertionError\n"
+               + "=================== test session starts ===================\n"
+               + failure.format("test_z") + "1 failed, 2 passed in 0.02s\n",
+               (4, 2, 2), ["first/test_api.py::test_z", "test_example.py::test_z"]),
+              ("incomplete-then-failing-quiet", failure.format("test_z")
+               + "F [100%]\n=================== FAILURES ===================\n"
+               + "=================== short test summary info ===================\n"
+               + failure.format("test_z") + "1 failed in 0.02s\n",
+               (2, 0, 2), ["test_example.py::test_z"]),
               ("captured-stdout", "F [100%]\n=================== FAILURES ===================\n"
                + "___________________ test_value ___________________\n"
                + "------------------- Captured stdout call -------------------\n10 passed in 0.50s\n"
@@ -769,6 +785,11 @@ jobs:
                       assert actual == counts, (label, mode, actual, counts)
                       assert f"**Counts:** total={counts[0]} passed={counts[1]} failed={counts[2]}" in report
                       assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == expected_names, (label, mode, report)
+                      classified = json.loads((report_dir / "classify.json").read_text())
+                      assert classified["failures"] == expected_names, (label, mode, classified)
+                      grouped = summary["failures_grouped"]
+                      assert sorted(name for group in grouped.values() for name in group) == sorted(expected_names)
+                      assert sum(summary["failures_by_class"].values()) == len(expected_names)
                       assert summary["exit_code"] == result.returncode, (label, mode, result.stderr)
                       if label == "multiple-runs":
                           assert summary["run_line"] == "8 passed in 0.01s; 1 failed, 2 passed in 0.02s"

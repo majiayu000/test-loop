@@ -69,11 +69,7 @@ case "$LANGUAGE" in
         # pytest short summary lines are "FAILED test_module.py::test_name".
         # Use run summaries for counts: quiet logs omit PASSED lines and
         # FAILED short-summary lines may repeat.
-        TEST_LINE_RX='^(FAILED|PASSED) '
-        PASS_LINE_RX='^PASSED '
-        FAIL_LINE_RX='^FAILED '
-        FAIL_NAME_RX='^FAILED (.+)$'
-        RUN_LINE_RX='^[=[:space:]]*[0-9]+ [[:alpha:]]+(, [0-9]+ [[:alpha:]]+)* in '
+        # Parsed below with Python to share node IDs with the classifier.
         ;;
     go)
         # go test verbose:
@@ -112,62 +108,70 @@ else
     SWIFT_EXIT=0
 fi
 
-# Pull out the run-summary lines. Swift may prefix them with a check mark.
-if [[ "$LANGUAGE" == "python" ]]; then
-    # pytest repeats captured output inside failure/error details. Those
-    # lines are test output, even when they look like a run summary.
-    RUN_LINES=$(awk -v summary_rx="$RUN_LINE_RX" '
-        /^=+ (FAILURES|ERRORS) =+$/ { in_details = 1 }
-        /^=+ short test summary info =+$/ { in_details = 0 }
-        !in_details && $0 ~ summary_rx { print }
-    ' "$LOG_FILE")
-else
-    RUN_LINES=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' || true)
-fi
-RUN_LINE=$(printf '%s\n' "$RUN_LINES" | tail -1)
-
-TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
-PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
-FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
-if [[ "$LANGUAGE" == "python" && -n "$RUN_LINES" ]]; then
-    read -r PASSED FAILED <<< "$(awk '
-        BEGIN { passed = failed = 0 }
-        {
-            for (i = 1; i < NF; i++) {
-                if ($(i + 1) ~ /^passed,?$/) passed += $i
-                if ($(i + 1) ~ /^failed,?$/) failed += $i
-            }
-        }
-        END { print passed, failed }
-    ' <<< "$RUN_LINES")"
-    TOTAL=$((PASSED + FAILED))
-    RUN_LINE="${RUN_LINES//$'\n'/; }"
-fi
-
-# Pull out the failing test names for the report. macOS ships bash 3.2 (no mapfile),
-# so use a temp file and a here-string read loop.
+# macOS ships bash 3.2 (no mapfile), so pass parsed failure names through a
+# temp file and a here-string read loop.
 FAILING_TESTS_TMP="$(mktemp)"
 trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
-grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" | awk -v language="$LANGUAGE" '
-    language == "python" {
-        # A trailer delimiter inside a bracketed parameter ID belongs to
-        # the node ID. Only strip the first delimiter outside that ID.
-        depth = 0
-        name_start = index($0, "::")
-        name_start = name_start ? name_start + 2 : 1
-        for (i = name_start; i <= length($0); i++) {
-            char = substr($0, i, 1)
-            if (char == "[") depth++
-            if (char == "]" && depth > 0) depth--
-            if (depth == 0 && substr($0, i, 3) == " - ") {
-                $0 = substr($0, 1, i - 1)
-                break
-            }
-        }
-        if (seen[$0]++) next
-    }
-    { print }
-' > "$FAILING_TESTS_TMP" || true
+if [[ "$LANGUAGE" == "python" ]]; then
+    PYTEST_REPORT=$(python3 - "$SCRIPT_DIR" "$LOG_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from classify_failures import extract_failing_names, pytest_node_id
+
+log = Path(sys.argv[2]).read_text(encoding="utf-8")
+passed = failed = 0
+run_passed, run_failed = set(), set()
+summaries = []
+in_details = False
+for line in log.splitlines():
+    if re.match(r"^=+ (test session starts|FAILURES|ERRORS) =+$", line):
+        passed += len(run_passed)
+        failed += len(run_failed)
+        run_passed.clear()
+        run_failed.clear()
+        in_details = False
+    if re.match(r"^=+ (FAILURES|ERRORS) =+$", line):
+        in_details = True
+    if re.match(r"^=+ short test summary info =+$", line):
+        in_details = False
+    if line.startswith("PASSED "):
+        run_passed.add(pytest_node_id(line[7:]))
+    if line.startswith("FAILED "):
+        run_failed.add(pytest_node_id(line[7:]))
+    if not in_details and re.match(r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in ", line):
+        counts = dict((status, int(count)) for count, status in
+                      re.findall(r"(\d+) (passed|failed)\b", line))
+        # A quiet passing run has no session banner. Retain failures from
+        # an earlier truncated run rather than discarding them here.
+        passed += max(counts.get("passed", 0), len(run_passed))
+        failed += max(counts.get("failed", 0), len(run_failed))
+        run_passed.clear()
+        run_failed.clear()
+        summaries.append(line)
+passed += len(run_passed)
+failed += len(run_failed)
+print(passed, failed)
+print("; ".join(summaries))
+for name in extract_failing_names(log, language="python"):
+    print(name)
+PY
+    )
+    read -r PASSED FAILED <<< "$PYTEST_REPORT"
+    TOTAL=$((PASSED + FAILED))
+    RUN_LINE=$(printf '%s\n' "$PYTEST_REPORT" | sed -n '2p')
+    printf '%s\n' "$PYTEST_REPORT" | sed -n '3,$p' > "$FAILING_TESTS_TMP"
+else
+    # Swift may prefix the run summary with a check mark.
+    RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' | tail -1 || true)
+    TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
+    PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
+    FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
+    grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
+fi
 FAILING_TESTS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && FAILING_TESTS+=("$line")

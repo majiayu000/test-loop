@@ -128,7 +128,7 @@ EXTRACT_PATTERNS: dict[str, re.Pattern[str]] = {
         re.MULTILINE,
     ),
     "python": re.compile(
-        r"^FAILED\s+\S*::?([A-Za-z_][A-Za-z0-9_]*)",  # pytest short summary
+        r"^FAILED\s+(.+::.+)$",  # complete pytest node ID and optional trailer
         re.MULTILINE,
     ),
     "go": re.compile(
@@ -180,6 +180,20 @@ def resolve_language(log_text: str, language: str) -> str:
     return language
 
 
+def pytest_node_id(text: str) -> str:
+    """Remove the assertion trailer while preserving the complete node ID."""
+    path, separator, test = text.partition("::")
+    if not separator:
+        return text.split(" - ", 1)[0]
+    # Custom parameter IDs are arbitrary text inside pytest's final brackets;
+    # an embedded closing bracket does not end the ID.
+    if "[" in test.split(" - ", 1)[0]:
+        test = test.rsplit("] - ", 1)[0] + "]" if "] - " in test else test
+    else:
+        test = test.split(" - ", 1)[0]
+    return path + separator + test
+
+
 def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     """Pull failing test names out of a test log, deduplicated.
 
@@ -195,12 +209,16 @@ def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     seen: dict[str, None] = {}
     for m in rx.finditer(log_text):
         name = m.group(1).strip()
+        if language == "python":
+            name = pytest_node_id(name)
         if name and name not in seen:
             seen[name] = None
     return list(seen.keys())
 
 
 def classify(name: str, language: str = "swift") -> str:
+    if language == "python":
+        name = (name.partition("::")[2] or name).split("[", 1)[0].rsplit("::", 1)[-1]
     patterns = PATTERNS.get(language, [])
     for label, rx in patterns:
         if rx.search(name):
@@ -409,7 +427,7 @@ FAILED test_module.py::test_rejects_invalid_input
         # we still dedupe.
         self.assertEqual(
             names,
-            ["test_rejects_invalid_input", "test_handles_missing_data"],
+            ["test_module.py::test_rejects_invalid_input", "test_module.py::test_handles_missing_data"],
         )
 
     def test_classify_python_routes_expected_failure(self) -> None:
@@ -481,7 +499,7 @@ FAILED test_module.py::test_handles_missing_data
         self.assertEqual(detect_language(log), "python")
         self.assertEqual(
             extract_failing_names(log, language="auto"),
-            ["test_rejects_invalid_input", "test_handles_missing_data"],
+            ["test_module.py::test_rejects_invalid_input", "test_module.py::test_handles_missing_data"],
         )
 
     def test_auto_detects_go(self) -> None:
