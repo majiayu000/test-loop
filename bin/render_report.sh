@@ -67,12 +67,12 @@ case "$LANGUAGE" in
         ;;
     python)
         # pytest short summary lines are "FAILED test_module.py::test_name".
-        # Use the final run summary for counts: quiet logs omit PASSED lines
-        # and FAILED short-summary lines may repeat.
+        # Use run summaries for counts: quiet logs omit PASSED lines and
+        # FAILED short-summary lines may repeat.
         TEST_LINE_RX='^(FAILED|PASSED) '
         PASS_LINE_RX='^PASSED '
         FAIL_LINE_RX='^FAILED '
-        FAIL_NAME_RX='^FAILED [^:]+::(.+)$'
+        FAIL_NAME_RX='^FAILED (.+)$'
         RUN_LINE_RX='^[=[:space:]]*[0-9]+ [[:alpha:]]+(, [0-9]+ [[:alpha:]]+)* in '
         ;;
     go)
@@ -112,24 +112,26 @@ else
     SWIFT_EXIT=0
 fi
 
-# Pull out the final run-summary line. Swift may prefix it with a check mark.
-RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | tail -1 | sed -E 's/^[✔✘] //' || true)
+# Pull out the run-summary lines. Swift may prefix them with a check mark.
+RUN_LINES=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' || true)
+RUN_LINE=$(printf '%s\n' "$RUN_LINES" | tail -1)
 
 TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
 PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
 FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
-if [[ "$LANGUAGE" == "python" && -n "$RUN_LINE" ]]; then
+if [[ "$LANGUAGE" == "python" && -n "$RUN_LINES" ]]; then
     read -r PASSED FAILED <<< "$(awk '
+        BEGIN { passed = failed = 0 }
         {
-            passed = failed = 0
             for (i = 1; i < NF; i++) {
-                if ($(i + 1) ~ /^passed,?$/) passed = $i
-                if ($(i + 1) ~ /^failed,?$/) failed = $i
+                if ($(i + 1) ~ /^passed,?$/) passed += $i
+                if ($(i + 1) ~ /^failed,?$/) failed += $i
             }
-            print passed, failed
         }
-    ' <<< "$RUN_LINE")"
+        END { print passed, failed }
+    ' <<< "$RUN_LINES")"
     TOTAL=$((PASSED + FAILED))
+    RUN_LINE="${RUN_LINES//$'\n'/; }"
 fi
 
 # Pull out the failing test names for the report. macOS ships bash 3.2 (no mapfile),
@@ -138,7 +140,18 @@ FAILING_TESTS_TMP="$(mktemp)"
 trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
 grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" | awk -v language="$LANGUAGE" '
     language == "python" {
-        sub(/ - .*/, "")
+        # A trailer delimiter inside a bracketed parameter ID belongs to
+        # the node ID. Only strip the first delimiter outside that ID.
+        depth = 0
+        for (i = 1; i <= length($0); i++) {
+            char = substr($0, i, 1)
+            if (char == "[") depth++
+            if (char == "]" && depth > 0) depth--
+            if (depth == 0 && substr($0, i, 3) == " - ") {
+                $0 = substr($0, 1, i - 1)
+                break
+            }
+        }
         if (seen[$0]++) next
     }
     { print }
