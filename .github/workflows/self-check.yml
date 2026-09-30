@@ -734,6 +734,15 @@ jobs:
                (2, 0, 2), ["tests/a/test_api.py::test_shared", "tests/b/test_api.py::test_shared"]),
               ("failure-then-pass", failure.format("test_z") + "1 failed in 0.01s\n2 passed in 0.02s\n",
                (3, 2, 1), ["test_example.py::test_z"]),
+              ("path-delimiter", "FAILED tests/a - b/test_params.py::test_value - assert False\n"
+               + "FAILED tests/a - c/test_params.py::test_value - assert False\n2 failed in 0.01s\n",
+               (2, 0, 2), ["tests/a - b/test_params.py::test_value", "tests/a - c/test_params.py::test_value"]),
+              ("captured-stdout", "F [100%]\n=================== FAILURES ===================\n"
+               + "___________________ test_value ___________________\n"
+               + "------------------- Captured stdout call -------------------\n10 passed in 0.50s\n"
+               + "=================== short test summary info ===================\n"
+               + failure.format("test_value") + "1 failed in 0.01s\n",
+               (1, 0, 1), ["test_example.py::test_value"]),
           ]
           source = Path.cwd()
           day = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()

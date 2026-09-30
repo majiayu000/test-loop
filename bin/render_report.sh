@@ -113,7 +113,17 @@ else
 fi
 
 # Pull out the run-summary lines. Swift may prefix them with a check mark.
-RUN_LINES=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' || true)
+if [[ "$LANGUAGE" == "python" ]]; then
+    # pytest repeats captured output inside failure/error details. Those
+    # lines are test output, even when they look like a run summary.
+    RUN_LINES=$(awk -v summary_rx="$RUN_LINE_RX" '
+        /^=+ (FAILURES|ERRORS) =+$/ { in_details = 1 }
+        /^=+ short test summary info =+$/ { in_details = 0 }
+        !in_details && $0 ~ summary_rx { print }
+    ' "$LOG_FILE")
+else
+    RUN_LINES=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' || true)
+fi
 RUN_LINE=$(printf '%s\n' "$RUN_LINES" | tail -1)
 
 TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
@@ -143,7 +153,9 @@ grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" | awk -v la
         # A trailer delimiter inside a bracketed parameter ID belongs to
         # the node ID. Only strip the first delimiter outside that ID.
         depth = 0
-        for (i = 1; i <= length($0); i++) {
+        name_start = index($0, "::")
+        name_start = name_start ? name_start + 2 : 1
+        for (i = name_start; i <= length($0); i++) {
             char = substr($0, i, 1)
             if (char == "[") depth++
             if (char == "]" && depth > 0) depth--
