@@ -753,6 +753,14 @@ jobs:
                + "=================== short test summary info ===================\n"
                + failure.format("test_z") + "1 failed in 0.02s\n",
                (2, 0, 2), ["test_example.py::test_z"]),
+              ("uncaptured-stdout", "=================== test session starts ===================\n"
+               + "test_example.py \n10 passed in 0.50s\n.\n\n"
+               + "=================== 1 passed in 0.01s ===================\n", (1, 1, 0), []),
+              ("uncaptured-stdout-quiet", "\n10 passed in 0.50s\n.\n1 passed in 0.01s\n", (1, 1, 0), []),
+              ("assertion-delimiter", "FAILED test_ids.py::test_value[a] - b] - AssertionError: whoops] - tail\n"
+               + "FAILED test_ids.py::test_value[a] - b] - AssertionError: other] - tail\n"
+               + "1 failed in 0.01s\n", (1, 0, 1), ["test_ids.py::test_value[a] - b]"]),
+              ("raw-bytes", b"\xff\n.\n1 passed in 0.01s\n", (1, 1, 0), []),
               ("captured-stdout", "F [100%]\n=================== FAILURES ===================\n"
                + "___________________ test_value ___________________\n"
                + "------------------- Captured stdout call -------------------\n10 passed in 0.50s\n"
@@ -763,6 +771,7 @@ jobs:
           source = Path.cwd()
           day = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()
           for label, log, counts, expected_names in cases:
+              log_bytes = log.encode() if isinstance(log, str) else log
               for mode in ("collect", "live"):
                   with tempfile.TemporaryDirectory(prefix="pytest-report-") as temp:
                       repo = Path(temp)
@@ -770,14 +779,14 @@ jobs:
                       report_dir = repo / "docs/reports" / day
                       report_dir.mkdir(parents=True)
                       if mode == "collect":
-                          (report_dir / "log.txt").write_text(log)
+                          (report_dir / "log.txt").write_bytes(log_bytes)
                           args = ["--collect"]
                       else:
-                          (repo / "input.log").write_text(log)
+                          (repo / "input.log").write_bytes(log_bytes)
                           args = ["--test-command", "cat input.log; exit 3"]
                       result = subprocess.run(
                           ["bash", str(repo / "bin/render_report.sh"), "--language", "python", *args],
-                          capture_output=True, text=True,
+                          capture_output=True,
                       )
                       summary = json.loads((report_dir / "summary.json").read_text())
                       report = (report_dir / "report.md").read_text()
@@ -797,8 +806,94 @@ jobs:
                           assert summary["run_line"] == "1 failed in 0.01s; 2 passed in 0.02s"
                       if mode == "live":
                           assert result.returncode == 3, (label, result.stderr)
-                      assert (report_dir / "log.txt").read_text() == log
+                      assert (report_dir / "log.txt").read_bytes() == log_bytes
                       print(f"PASS: {label} ({mode})")
+          PY
+      - name: pytest output and classifier failure boundaries
+        run: |
+          python3 -m pip install pytest
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          source = Path.cwd()
+          day = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()
+          cases = [
+              ("stdout", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-s", (1, 1, 0), []),
+              ("stdout-quiet", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-q -s", (1, 1, 0), []),
+              ("bytes", "import os\ndef test_output():\n    os.write(1, b'\\xff\\n')\n", "-q -s", (1, 1, 0), []),
+              ("ids", "import pytest\n@pytest.mark.parametrize('x', [1, 2], ids=['a] - b', 'a] - c'])\n"
+               + "def test_output(x):\n    raise AssertionError('whoops] - tail')\n", "-q", (2, 0, 2),
+               ["test_boundary.py::test_output[a] - b]", "test_boundary.py::test_output[a] - c]"]),
+          ]
+          for label, test_source, flags, counts, names in cases:
+              with tempfile.TemporaryDirectory() as temp:
+                  repo = Path(temp)
+                  shutil.copytree(source / "bin", repo / "bin")
+                  (repo / "test_boundary.py").write_text(test_source)
+                  command = shlex.quote(sys.executable) + " -m pytest --color=no " + flags
+                  command += " test_boundary.py"
+                  run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", "--test-command", command],
+                                       cwd=repo, capture_output=True, env=os.environ | {"CI": "true"})
+                  artifacts = repo / "docs/reports" / day
+                  raw = (artifacts / "log.txt").read_bytes()
+                  assert raw == run.stdout
+                  assert run.returncode == (1 if names else 0), (label, run.stderr)
+                  if label == "bytes":
+                      assert b"\xff" in raw
+                  for mode in ("live", "collect"):
+                      if mode == "collect":
+                          run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", "--collect"],
+                                               cwd=repo, capture_output=True)
+                      summary = json.loads((artifacts / "summary.json").read_text())
+                      report = (artifacts / "report.md").read_text()
+                      classified = json.loads((artifacts / "classify.json").read_text())
+                      assert tuple(summary[k] for k in ("total", "passed", "failed")) == counts, (label, mode, summary)
+                      assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == names
+                      assert classified["failures"] == names and not summary.get("classify_error")
+                      assert summary["exit_code"] == run.returncode
+                      assert (artifacts / "log.txt").read_bytes() == raw
+                      print(f"PASS: actual pytest {label} ({mode})")
+          for breakage in ("missing", "syntax", "import"):
+              for failed in (False, True):
+                  for mode in ("collect", "live"):
+                      with tempfile.TemporaryDirectory() as temp:
+                          repo = Path(temp)
+                          shutil.copytree(source / "bin", repo / "bin")
+                          classifier = repo / "bin/classify_failures.py"
+                          if breakage == "missing":
+                              classifier.unlink()
+                          elif breakage == "syntax":
+                              classifier.write_text("invalid syntax !\n")
+                          else:
+                              classifier.write_text("raise RuntimeError('import failure')\n")
+                          log = b"FAILED test_a.py::test_fail - AssertionError\n1 failed in 0.01s\n" if failed else b"1 passed in 0.01s\n"
+                          artifacts = repo / "docs/reports" / day
+                          artifacts.mkdir(parents=True)
+                          if mode == "collect":
+                              (artifacts / "log.txt").write_bytes(log)
+                              args = ["--collect"]
+                          else:
+                              (repo / "input.log").write_bytes(log)
+                              args = ["--test-command", "cat input.log; exit 3"]
+                          run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", *args],
+                                               cwd=repo, capture_output=True)
+                          summary = json.loads((artifacts / "summary.json").read_text())
+                          assert summary["classify_error"] and summary["exit_code"] == run.returncode
+                          assert tuple(summary[k] for k in ("total", "passed", "failed")) == (1, int(not failed), int(failed))
+                          assert (artifacts / "report.md").exists() and (artifacts / "classify.err").stat().st_size
+                          assert b"classify_failures.py failed" in run.stderr
+                          assert (artifacts / "log.txt").read_bytes() == log
+                          if mode == "live":
+                              assert run.returncode == 3
+                          print(f"PASS: degraded {breakage} failed={failed} ({mode})")
           PY
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test

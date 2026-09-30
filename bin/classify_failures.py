@@ -180,15 +180,22 @@ def resolve_language(log_text: str, language: str) -> str:
     return language
 
 
-def pytest_node_id(text: str) -> str:
+def pytest_node_id(text: str, headlines: Iterable[str] = ()) -> str:
     """Remove the assertion trailer while preserving the complete node ID."""
     path, separator, test = text.partition("::")
     if not separator:
         return text.split(" - ", 1)[0]
-    # Custom parameter IDs are arbitrary text inside pytest's final brackets;
-    # an embedded closing bracket does not end the ID.
+    # Failure headlines give the complete test name even when its parameter
+    # ID contains delimiters. Use that evidence before inspecting the trailer.
+    for headline in sorted(headlines, key=len, reverse=True):
+        if test == headline or test.startswith(headline + " - "):
+            return path + separator + headline
     if "[" in test.split(" - ", 1)[0]:
-        test = test.rsplit("] - ", 1)[0] + "]" if "] - " in test else test
+        # The reason begins with an assertion or exception label; a later
+        # closing bracket in arbitrary reason text does not end the node ID.
+        trailer = re.search(r"\] - (?=assert\b|[\w.]+(?::|$))", test)
+        if trailer:
+            test = test[:trailer.start() + 1]
     else:
         test = test.split(" - ", 1)[0]
     return path + separator + test
@@ -206,11 +213,12 @@ def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     """
     language = resolve_language(log_text, language)
     rx = EXTRACT_PATTERNS[language]
+    headlines = re.findall(r"^_+ (.+?) _+$", log_text, re.MULTILINE) if language == "python" else []
     seen: dict[str, None] = {}
     for m in rx.finditer(log_text):
         name = m.group(1).strip()
         if language == "python":
-            name = pytest_node_id(name)
+            name = pytest_node_id(name, headlines)
         if name and name not in seen:
             seen[name] = None
     return list(seen.keys())
@@ -265,7 +273,7 @@ def main(argv: list[str]) -> int:
         print("error: log file required", file=sys.stderr)
         return 2
 
-    with open(log_path, "r", encoding="utf-8") as f:
+    with open(log_path, "r", encoding="utf-8", errors="backslashreplace") as f:
         log_text = f.read()
 
     try:

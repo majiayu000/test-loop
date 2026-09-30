@@ -108,41 +108,78 @@ else
     SWIFT_EXIT=0
 fi
 
+# Classify failing tests by naming convention. Output is a small JSON file
+# that we then merge into summary.json. classify_failures.py is a sibling of
+# this script, so $SCRIPT_DIR resolves it whether installed under bin/ or
+# scripts/.
+CLASSIFY_FILE="$REPORT_DIR/classify.json"
+CLASSIFY_ERR="$REPORT_DIR/classify.err"
+if python3 "$SCRIPT_DIR/classify_failures.py" --language "$LANGUAGE" --in "$LOG_FILE" --out "$CLASSIFY_FILE" 2>"$CLASSIFY_ERR"; then
+    rm -f "$CLASSIFY_ERR"
+else
+    # Do not hide the failure behind an empty {} (no silent degradation):
+    # surface the error and flag the classification as degraded.
+    echo "error: classify_failures.py failed; see $CLASSIFY_ERR" >&2
+    cat "$CLASSIFY_ERR" >&2 || true
+    echo '{"failures": [], "failures_by_class": {}, "failures_grouped": {}, "classify_error": true}' > "$CLASSIFY_FILE"
+fi
+
 # macOS ships bash 3.2 (no mapfile), so pass parsed failure names through a
 # temp file and a here-string read loop.
 FAILING_TESTS_TMP="$(mktemp)"
 trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
 if [[ "$LANGUAGE" == "python" ]]; then
-    PYTEST_REPORT=$(python3 - "$SCRIPT_DIR" "$LOG_FILE" <<'PY'
+    PYTEST_REPORT=$(python3 - "$LOG_FILE" "$CLASSIFY_FILE" <<'PY'
+import json
 import re
 import sys
 from pathlib import Path
 
-sys.dont_write_bytecode = True
-sys.path.insert(0, sys.argv[1])
-from classify_failures import extract_failing_names, pytest_node_id
-
-log = Path(sys.argv[2]).read_text(encoding="utf-8")
+# Classification already ran at its guarded boundary. Counting and rendering
+# still work from the raw log when that call produced a degraded result.
+names = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))["failures"]
+log = Path(sys.argv[1]).read_text(encoding="utf-8", errors="backslashreplace")
+lines = log.splitlines()
+progress_rx = r"^(?:.*\.py\s+)?[.FEsxX]+(?:\s+\[\s*\d+%\])?\s*$"
+has_runner_output = any(re.match(progress_rx, line) or
+                        re.match(r"^=+ test session starts =+$", line) for line in lines)
+last_line = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
+failing_names = dict.fromkeys(names)
 passed = failed = 0
 run_passed, run_failed = set(), set()
 summaries = []
 in_details = False
-for line in log.splitlines():
+in_session = in_short_summary = False
+for i, line in enumerate(lines):
     if re.match(r"^=+ (test session starts|FAILURES|ERRORS) =+$", line):
         passed += len(run_passed)
         failed += len(run_failed)
         run_passed.clear()
         run_failed.clear()
         in_details = False
+        in_short_summary = False
+    if re.match(r"^=+ test session starts =+$", line):
+        in_session = True
     if re.match(r"^=+ (FAILURES|ERRORS) =+$", line):
         in_details = True
     if re.match(r"^=+ short test summary info =+$", line):
         in_details = False
+        in_short_summary = True
     if line.startswith("PASSED "):
-        run_passed.add(pytest_node_id(line[7:]))
+        run_passed.add(line[7:])
     if line.startswith("FAILED "):
-        run_failed.add(pytest_node_id(line[7:]))
-    if not in_details and re.match(r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in ", line):
+        raw_name = line[7:]
+        name = max((name for name in names if raw_name == name or
+                    raw_name.startswith(name + " - ")), key=len, default=raw_name)
+        run_failed.add(name)
+        failing_names.setdefault(name, None)
+    # Non-quiet pytest decorates its summary. Quiet summaries follow progress
+    # or short-summary details, or terminate the log. Test stdout before
+    # progress (notably with -s) is not a run summary.
+    summary_position = line.startswith("=") or in_short_summary or i == last_line or (
+        not in_session and (not has_runner_output or
+                            (i > 0 and re.match(progress_rx, lines[i - 1]))))
+    if not in_details and summary_position and re.match(r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in ", line):
         counts = dict((status, int(count)) for count, status in
                       re.findall(r"(\d+) (passed|failed)\b", line))
         # A quiet passing run has no session banner. Retain failures from
@@ -152,11 +189,12 @@ for line in log.splitlines():
         run_passed.clear()
         run_failed.clear()
         summaries.append(line)
+        in_session = in_short_summary = False
 passed += len(run_passed)
 failed += len(run_failed)
 print(passed, failed)
 print("; ".join(summaries))
-for name in extract_failing_names(log, language="python"):
+for name in failing_names:
     print(name)
 PY
     )
@@ -176,22 +214,6 @@ FAILING_TESTS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && FAILING_TESTS+=("$line")
 done < "$FAILING_TESTS_TMP"
-
-# Classify failing tests by naming convention. Output is a small JSON file
-# that we then merge into summary.json. classify_failures.py is a sibling of
-# this script, so $SCRIPT_DIR resolves it whether installed under bin/ or
-# scripts/.
-CLASSIFY_FILE="$REPORT_DIR/classify.json"
-CLASSIFY_ERR="$REPORT_DIR/classify.err"
-if python3 "$SCRIPT_DIR/classify_failures.py" --language "$LANGUAGE" --in "$LOG_FILE" --out "$CLASSIFY_FILE" 2>"$CLASSIFY_ERR"; then
-    rm -f "$CLASSIFY_ERR"
-else
-    # Do not hide the failure behind an empty {} (no silent degradation):
-    # surface the error and flag the classification as degraded.
-    echo "error: classify_failures.py failed; see $CLASSIFY_ERR" >&2
-    cat "$CLASSIFY_ERR" >&2 || true
-    echo '{"failures": [], "failures_by_class": {}, "failures_grouped": {}, "classify_error": true}' > "$CLASSIFY_FILE"
-fi
 
 [[ -z "$RUN_LINE" ]] && RUN_LINE="(no summary line found)"
 
