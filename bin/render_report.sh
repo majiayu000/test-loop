@@ -117,6 +117,12 @@ TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
 PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
 FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
 
+# A collected log has no process status; parsed failures must still fail the
+# report. Preserve an existing non-zero status from a live test command.
+if [[ $FAILED -gt 0 && $SWIFT_EXIT -eq 0 ]]; then
+    SWIFT_EXIT=1
+fi
+
 # Pull out the failing test names for the report. macOS ships bash 3.2 (no mapfile),
 # so use a temp file and a here-string read loop.
 FAILING_TESTS_TMP="$(mktemp)"
