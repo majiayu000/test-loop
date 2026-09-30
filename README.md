@@ -8,8 +8,9 @@ A small, language-agnostic toolkit for the **closed test loop**:
 drift detection, failure classification, structured reports, a pre-commit
 guardrail, and a CI workflow you can copy into any project.
 
-> Status: design phase. Skills and their contracts are written; the
-> script preview, copyable templates, and self-check workflow are tracked in
+> Status: skills and a working script preview. Target projects still need
+> their own language globs, test commands, and knowledge-base content. The
+> copyable templates and self-check workflow are tracked in
 > [docs/knowledge/L0_overview.md](docs/knowledge/L0_overview.md).
 
 ## What it is
@@ -70,8 +71,8 @@ as a working preview that still needs project-specific adaptation.
 
 | Project | Relationship |
 | --- | --- |
-| [aitest-kit](../aitest-kit) | A deeper, Python-specific toolchain that *compiles* Markdown test designs into pytest code. test-loop is the lighter sibling: no codegen, no module profile, no emitter. |
-| [caff](../caff) | A macOS menu bar app where this loop was first built out end-to-end. caff 0.1.4 ships the loop in its own `scripts/`, `docs/knowledge/`, `.githooks/`, and `.github/workflows/`. test-loop generalises what caff proved. |
+| `aitest-kit` | A deeper, Python-specific toolchain that *compiles* Markdown test designs into pytest code. test-loop is the lighter sibling: no codegen, no module profile, no emitter. No public repository link is currently available. |
+| [caff](https://github.com/majiayu000/caff) | A macOS menu bar app where this loop was first built out end-to-end. caff 0.1.4 ships the loop in its own `scripts/`, `docs/knowledge/`, `.githooks/`, and `.github/workflows/`. test-loop generalises what caff proved. |
 
 ## Skills (the entry points)
 
