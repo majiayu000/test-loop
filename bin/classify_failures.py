@@ -78,11 +78,14 @@ PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
         # pytest: `test_foo` is conventional, but the failing test name
         # is preceded by "FAILED " in the short summary and "____ test_foo ____"
         # in the verbose summary. The class is `TestError` / `TestInvalid` /
-        # `TestRejects` etc.; match those class names and snake_case keywords.
+        # `TestRejects` etc.; match those class names and snake_case/camelCase
+        # keywords. Case-transition boundaries must remain case-sensitive.
         (
             "EXPECTED_FAILURE",
             re.compile(
-                r"((^|_)(Rejects?|Refus(es|ing|ed)?|Invalid|ErrorContains|DataCorrupted)(_|$)"
+                r"((^|_|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
+                r"(Rejects?|Refus(es|ing|ed)?|Invalid|ErrorContains|DataCorrupted)"
+                r"(?=_|$|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
                 r"|TestError|TestInvalid|TestReject)",
                 re.IGNORECASE,
             ),
@@ -430,6 +433,16 @@ FAILED test_module.py::test_rejects_invalid_input
             "test_prerejects_cache",
             "test_refusedly_sorted",
             "test_happy_path",
+            "testWithoutCache",
+            "testWithdraw",
+            "testValueInvalidationFlow",
+            "testPrerejectsCache",
+            "testRefusedlySorted",
+            "testValueDataCorruptedlySorted",
+            "testValueErrorContainslySorted",
+            "test_REFUSEDLY_SORTED",
+            "test_INVALIDATION_FLOW",
+            "testrefusesEmpty",
         ]:
             with self.subTest(name=name):
                 self.assertEqual(classify(name, language="python"), "ASSERTION_FAILURE")
@@ -449,6 +462,18 @@ FAILED test_module.py::test_rejects_invalid_input
             "test_with_invalid_input",
             "test_errorcontains_detail",
             "test_datacorrupted_payload",
+            "testRejectEmpty",
+            "testValueRejectsEmpty",
+            "testRefusesEmpty",
+            "testRefusingEmpty",
+            "testRefusedEmpty",
+            "testWithInvalidValue",
+            "testValueInvalid",
+            "testErrorContainsDetail",
+            "testDataCorruptedPayload",
+            "test_refusesEmpty",
+            "testDataCorrupted_payload",
+            "test_REFUSES_EMPTY",
             "TestError",
             "TestInvalid",
             "TestRejects",
