@@ -842,6 +842,20 @@ jobs:
               ('teardown-cleanup', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
               ('teardown-decorated', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n================ 10 passed in 0.50s ================')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
               ('teardown-blank', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
+              ("atexit-quiet", "import atexit\natexit.register(lambda: print('10 passed in 0.50s'))\n"
+               + "def test_output():\n    pass\n", "-q -s", (1, 1, 0), []),
+              ("atexit-normal", "import atexit\natexit.register(lambda: print('10 passed in 0.50s'))\n"
+               + "def test_output():\n    pass\n", "-s", (1, 1, 0), []),
+              ("atexit-captured", "import atexit\natexit.register(lambda: print('10 passed in 0.50s'))\n"
+               + "def test_output():\n    pass\n", "-q", (1, 1, 0), []),
+              ("compound-quiet", "def test_output():\n    pass\n", "-q -s", (1, 1, 0), []),
+              ("compound-normal", "def test_output():\n    pass\n", "-s", (1, 1, 0), []),
+              ("compound-captured", "def test_output():\n    pass\n", "-q", (1, 1, 0), []),
+              ("compound-cleanup", "def test_output():\n    pass\n", "-q -s", (1, 1, 0), []),
+              ("teardown-atexit", "import atexit\nimport pytest\n"
+               + "atexit.register(lambda: print('10 passed in 0.50s'))\n@pytest.fixture\ndef resource():\n"
+               + "    yield\n    print('\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n",
+               "-q -s", (1, 1, 0), []),
               ("bytes", "import os\ndef test_output():\n    os.write(1, b'\\xff\\n')\n", "-q -s", (1, 1, 0), []),
               ("ids", "import pytest\n@pytest.mark.parametrize('x', [1, 2], ids=['a] - b', 'a] - c'])\n"
                + "def test_output(x):\n    raise AssertionError('whoops] - tail')\n", "-q", (2, 0, 2),
@@ -856,6 +870,10 @@ jobs:
                   command += " test_boundary.py"
                   if label.startswith("warnings") or label == "teardown-cleanup":
                       command += "; echo cleanup"
+                  if label == "compound-cleanup":
+                      command += "; echo cleanup"
+                  if label.startswith("compound"):
+                      command += "; printf '10 passed in 0.50s\\n'"
                   run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", "--test-command", command],
                                        cwd=repo, capture_output=True, env=os.environ | {"CI": "true"})
                   artifacts = repo / "docs/reports" / day
@@ -872,8 +890,10 @@ jobs:
                       report = (artifacts / "report.md").read_text()
                       classified = json.loads((artifacts / "classify.json").read_text())
                       assert tuple(summary[k] for k in ("total", "passed", "failed")) == counts, (label, mode, summary)
-                      if label.startswith("teardown"):
+                      if label.startswith(("teardown", "atexit", "compound")):
                           assert "10 passed" not in summary["run_line"], (label, mode, summary)
+                      if label.startswith(("atexit", "compound")) or label == "teardown-atexit":
+                          assert raw.endswith(b"10 passed in 0.50s\n")
                       if label == "teardown-cleanup":
                           assert raw.endswith(b"cleanup\n")
                       if label.startswith("warnings"):

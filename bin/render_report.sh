@@ -164,14 +164,18 @@ progress_rx = r"^(?:.*\.py\s+)?[.FEsxX]+(?:\s+\[\s*\d+%\])?\s*$"
 has_runner_output = any(re.match(progress_rx, line) or
                         re.match(r"^=+ test session starts =+$", line) for line in lines)
 summary_rx = r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in "
-# Progress is written before fixture teardown. Only the final summary-shaped
-# line before the next run's progress or session banner can end that run.
+# Progress is written before fixture teardown. Select the final summary at a
+# pytest footer boundary, ignoring later count-shaped lines without one.
 terminal_summaries = set()
 seen_summary = False
 for i in range(len(lines) - 1, -1, -1):
     if re.match(progress_rx, lines[i]) or re.match(r"^=+ test session starts =+$", lines[i]):
         seen_summary = False
-    if re.match(summary_rx, lines[i]):
+    previous = lines[i - 1] if i else ""
+    footer_boundary = (not previous.strip() or re.match(progress_rx, previous) or
+                       previous.startswith(("FAILED ", "PASSED ",
+                                            "-- Docs: https://docs.pytest.org/")))
+    if footer_boundary and re.match(summary_rx, lines[i]):
         if not seen_summary:
             terminal_summaries.add(i)
         seen_summary = True
