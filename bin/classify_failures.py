@@ -77,16 +77,16 @@ PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
     "python": [
         # pytest: `test_foo` is conventional, but the failing test name
         # is preceded by "FAILED " in the short summary and "____ test_foo ____"
-        # in the verbose summary. The class is `TestError` / `TestInvalid` /
-        # `TestRejects` etc.; match those class names and snake_case/camelCase
-        # keywords. Case-transition boundaries must remain case-sensitive.
+        # in the verbose summary. Match snake_case/camelCase keywords in
+        # the extracted test name, not the enclosing pytest class name.
+        # Case-transition boundaries must remain case-sensitive.
         (
             "EXPECTED_FAILURE",
             re.compile(
                 r"((^|_|(?-i:(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])))"
-                r"(Rejects?|Refus(es|ing|ed)?|Invalid|ErrorContains|DataCorrupted)"
+                r"(Reject(s|ing|ed)?|Refus(e[sd]?|ing)|Invalid|ErrorContains|DataCorrupted)"
                 r"(?=_|$|[0-9]|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
-                r"|TestError|TestInvalid|TestReject)",
+                r"|^TestError$)",
                 re.IGNORECASE,
             ),
         ),
@@ -450,6 +450,16 @@ FAILED test_module.py::test_rejects_invalid_input
             "testHTTPPrerejectsCache",
             "testHTTPREJECTSCACHE",
             "testHTTPrefusesEmpty",
+            "testInvalidationFlow",
+            "testErrorContainslySorted",
+            "testRejectableValue",
+            "test_rejectable_value",
+            "test_rejectedly_sorted",
+            "test_rejectingly_sorted",
+            "test_refusely_sorted",
+            "testTestInvalidationFlow",
+            "testTestErrorContainslySorted",
+            "testTestRejectableValue",
         ]:
             with self.subTest(name=name):
                 self.assertEqual(classify(name, language="python"), "ASSERTION_FAILURE")
@@ -463,6 +473,9 @@ FAILED test_module.py::test_rejects_invalid_input
             "test_refuses_empty",
             "test_refusing_empty",
             "test_refused_empty",
+            "test_rejecting_input",
+            "test_rejected_input",
+            "test_refuse_empty",
             "test_invalid",
             "test_invalid_input",
             "test_value_invalid",
@@ -474,6 +487,9 @@ FAILED test_module.py::test_rejects_invalid_input
             "testRefusesEmpty",
             "testRefusingEmpty",
             "testRefusedEmpty",
+            "testRejectingInput",
+            "testRejectedInput",
+            "testRefuseEmpty",
             "testWithInvalidValue",
             "testValueInvalid",
             "testErrorContainsDetail",
@@ -487,6 +503,9 @@ FAILED test_module.py::test_rejects_invalid_input
             "testResponseRejects404",
             "testValueInvalid3D",
             "testMessageErrorContains500",
+            "testHTTPRejecting404",
+            "testXMLRejected3D",
+            "testJSONRefuse500",
             "TestError",
             "TestInvalid",
             "TestRejects",
