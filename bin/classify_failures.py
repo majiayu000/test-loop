@@ -78,12 +78,12 @@ PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
         # pytest: `test_foo` is conventional, but the failing test name
         # is preceded by "FAILED " in the short summary and "____ test_foo ____"
         # in the verbose summary. The class is `TestError` / `TestInvalid` /
-        # `TestRejects` etc.; we match on those substrings after `Test`.
+        # `TestRejects` etc.; match those class names and snake_case keywords.
         (
             "EXPECTED_FAILURE",
             re.compile(
-                r"(Rejects?|Refus(es|ing|ed)?|Invalid|ErrorContains|DataCorrupted"
-                r"|With[A-Z][a-z]+|TestError|TestInvalid|TestReject)",
+                r"((^|_)(Rejects?|Refus(es|ing|ed)?|Invalid|ErrorContains|DataCorrupted)(_|$)"
+                r"|TestError|TestInvalid|TestReject)",
                 re.IGNORECASE,
             ),
         ),
@@ -421,6 +421,40 @@ FAILED test_module.py::test_rejects_invalid_input
             classify("test_happy_path", language="python"),
             "ASSERTION_FAILURE",
         )
+
+    def test_classify_python_ordinary_snake_case_names(self) -> None:
+        for name in [
+            "test_without_cache",
+            "test_withdraw",
+            "test_invalidation_flow",
+            "test_prerejects_cache",
+            "test_refusedly_sorted",
+            "test_happy_path",
+        ]:
+            with self.subTest(name=name):
+                self.assertEqual(classify(name, language="python"), "ASSERTION_FAILURE")
+
+    def test_classify_python_negative_path_boundaries(self) -> None:
+        for name in [
+            "rejects",
+            "invalid_input",
+            "test_reject",
+            "test_rejects_invalid_input",
+            "test_refuses_empty",
+            "test_refusing_empty",
+            "test_refused_empty",
+            "test_invalid",
+            "test_invalid_input",
+            "test_value_invalid",
+            "test_with_invalid_input",
+            "test_errorcontains_detail",
+            "test_datacorrupted_payload",
+            "TestError",
+            "TestInvalid",
+            "TestRejects",
+        ]:
+            with self.subTest(name=name):
+                self.assertEqual(classify(name, language="python"), "EXPECTED_FAILURE")
 
     def test_extracts_go_test_verbose(self) -> None:
         log = """
