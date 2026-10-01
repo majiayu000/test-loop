@@ -84,8 +84,9 @@ PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
             "EXPECTED_FAILURE",
             re.compile(
                 r"((^|_|(?-i:(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])))"
-                r"(Reject(s|ing|ed)?|Refus(e[sd]?|ing)|Invalid|ErrorContains|DataCorrupted)"
-                r"(?=_|$|[0-9]|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
+                r"(Reject(s|ing|ed)?|Refus(e[sd]?|ing)|Invalid"
+                r"|(?:(?-i:[A-Z]+(?=[A-Z])))?(ErrorContains|DataCorrupted))"
+                r"(?=_|$|[0-9]|(?-i:(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])))"
                 r"|^TestError$)",
                 re.IGNORECASE,
             ),
@@ -460,6 +461,15 @@ FAILED test_module.py::test_rejects_invalid_input
             "testTestInvalidationFlow",
             "testTestErrorContainslySorted",
             "testTestRejectableValue",
+            "testINVALIDATIONFlow",
+            "testREJECTABLEValue",
+            "testREFUSEDLYSorted",
+            "testERRORCONTAINSLYSorted",
+            "testDATACORRUPTEDLYSorted",
+            "testPREREJECTSCache",
+            "testHTTPerrorcontainsDetail",
+            "testHTTPERRORCONTAINSLYSorted",
+            "testHTTPDATACORRUPTEDLYSorted",
         ]:
             with self.subTest(name=name):
                 self.assertEqual(classify(name, language="python"), "ASSERTION_FAILURE")
@@ -506,6 +516,12 @@ FAILED test_module.py::test_rejects_invalid_input
             "testHTTPRejecting404",
             "testXMLRejected3D",
             "testJSONRefuse500",
+            "testINVALIDValue",
+            "testREJECTSBadInput",
+            "testHTTPERRORCONTAINSDetail",
+            "testDATACORRUPTEDPayload",
+            "testREFUSEDEmpty",
+            "testHTTPDATACORRUPTEDPayload",
             "TestError",
             "TestInvalid",
             "TestRejects",
