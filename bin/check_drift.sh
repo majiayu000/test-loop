@@ -573,18 +573,18 @@ emit_awk() {
             '
             ;;
         python)
-            # Match top-level (zero-indent) class/def and names that are not
-            # private (no leading underscore). Multiline `class Foo(Bar):`
+            # Match top-level (zero-indent) class/def/async def with public
+            # names (no leading underscore). Multiline `class Foo(Bar):`
             # and `def foo(x):` are common.
             awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
-                # top-level class or def (no leading whitespace)
-                /^class[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
+                # top-level class or (async) def (no leading whitespace)
+                /^class[[:space:]]+[A-Za-z][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
                         if ($i == "class") { print ident($(i+1)); break }
                     }
                 }
-                /^def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
+                /^(async[[:space:]]+)?def[[:space:]]+[A-Za-z][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
                         if ($i == "def") { print ident($(i+1)); break }
                     }

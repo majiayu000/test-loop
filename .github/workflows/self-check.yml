@@ -696,6 +696,76 @@ jobs:
             docs/knowledge/L1_chain.md 2>/dev/null || true
           rm -rf Sources/CaffCore docs/knowledge/L1_chain_target.md \
             docs/knowledge/L1_chain_middle.md docs/knowledge/L1_chain.md
+      - name: check_drift Python public async and private names
+        run: |
+          python3 - <<'PY'
+          import shutil
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp)
+              (root / "bin").mkdir()
+              shutil.copy2("bin/check_drift.sh", root / "bin/check_drift.sh")
+              subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+              subprocess.run([
+                  "git", "-c", "user.name=Self Check",
+                  "-c", "user.email=self-check@example.invalid",
+                  "commit", "--allow-empty", "-qm", "baseline",
+              ], cwd=root, check=True)
+
+              def check(source, public, documented=()):
+                  (root / "api.py").write_text(source)
+                  (root / "knowledge.md").write_text("\n".join(documented))
+                  subprocess.run([
+                      "git", "add", "api.py", "knowledge.md",
+                  ], cwd=root, check=True)
+                  # The staged declaration must win over a different worktree.
+                  (root / "api.py").write_text("def _worktree_only(): pass\n")
+                  result = subprocess.run([
+                      "bin/check_drift.sh", "--staged", "--language", "python",
+                      "--source-glob", "api.py", "--knowledge-base", "knowledge.md",
+                  ], cwd=root, capture_output=True, text=True)
+                  print(result.stdout, end="")
+                  missing = public - set(documented)
+                  assert result.returncode == int(bool(missing)), result
+                  actual = {
+                      line.split(":", 1)[1]
+                      for line in result.stdout.splitlines()
+                      if line.startswith("  - api.py:")
+                  }
+                  assert actual == missing, (actual, missing, result)
+                  assert f"scanned {len(public)} public symbol(s)" in result.stdout, result
+                  assert ("drift: clean" in result.stdout) == (not missing), result
+
+              check("async def fetch_public(): pass\n", {"fetch_public"})
+              check(
+                  "def _private_helper(): pass\n"
+                  "async def _private_async(): pass\n"
+                  "class _PrivateType: pass\n",
+                  set(),
+              )
+              mixed = (
+                  "# def commented_public(): pass\n"
+                  "# async def commented_async(): pass\n"
+                  "# class CommentedType: pass\n"
+                  "async\tdef fetch_public(): pass\n"
+                  "def public_sync_2():\n"
+                  "    def nested_public(): pass\n"
+                  "    async def nested_async(): pass\n"
+                  "    class NestedType: pass\n"
+                  "class PublicType_2:\n"
+                  "    def member_public(self): pass\n"
+                  "    async def member_async(self): pass\n"
+                  "def _private_helper(): pass\n"
+                  "class _PrivateType: pass\n"
+              )
+              public = {"fetch_public", "public_sync_2", "PublicType_2"}
+              check(mixed, public)
+              check(mixed, public, public)
+              check(mixed, public, {"fetch_public", "PublicType_2"})
+          PY
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
