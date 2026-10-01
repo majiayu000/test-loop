@@ -83,9 +83,9 @@ PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
         (
             "EXPECTED_FAILURE",
             re.compile(
-                r"((^|_|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
+                r"((^|_|(?-i:(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])))"
                 r"(Rejects?|Refus(es|ing|ed)?|Invalid|ErrorContains|DataCorrupted)"
-                r"(?=_|$|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
+                r"(?=_|$|[0-9]|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
                 r"|TestError|TestInvalid|TestReject)",
                 re.IGNORECASE,
             ),
@@ -443,6 +443,13 @@ FAILED test_module.py::test_rejects_invalid_input
             "test_REFUSEDLY_SORTED",
             "test_INVALIDATION_FLOW",
             "testrefusesEmpty",
+            "testHTTPInvalidationFlow",
+            "testXMLRefusedlySorted",
+            "testJSONDataCorruptedlySorted",
+            "testHTTPErrorContainslySorted",
+            "testHTTPPrerejectsCache",
+            "testHTTPREJECTSCACHE",
+            "testHTTPrefusesEmpty",
         ]:
             with self.subTest(name=name):
                 self.assertEqual(classify(name, language="python"), "ASSERTION_FAILURE")
@@ -474,6 +481,12 @@ FAILED test_module.py::test_rejects_invalid_input
             "test_refusesEmpty",
             "testDataCorrupted_payload",
             "test_REFUSES_EMPTY",
+            "testHTTPRejectsBadResponse",
+            "testXMLInvalidDocument",
+            "testJSONDataCorruptedPayload",
+            "testResponseRejects404",
+            "testValueInvalid3D",
+            "testMessageErrorContains500",
             "TestError",
             "TestInvalid",
             "TestRejects",
