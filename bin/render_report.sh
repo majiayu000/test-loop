@@ -252,6 +252,12 @@ while IFS= read -r line; do
     [[ -n "$line" ]] && FAILING_TESTS+=("$line")
 done < "$FAILING_TESTS_TMP"
 
+# A collected log has no process status; parsed failures must still fail the
+# report. Preserve an existing non-zero status from a live test command.
+if [[ $FAILED -gt 0 && $SWIFT_EXIT -eq 0 ]]; then
+    SWIFT_EXIT=1
+fi
+
 [[ -z "$RUN_LINE" ]] && RUN_LINE="(no summary line found)"
 
 # Write a small JSON summary. Use python3 for safe JSON encoding.

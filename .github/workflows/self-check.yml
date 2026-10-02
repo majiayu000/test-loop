@@ -974,6 +974,117 @@ jobs:
                           assert run.returncode == 3
                       print(f"PASS: degraded duplicate {breakage} ({mode})")
           PY
+      - name: render_report collect and live verdicts
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+
+          root = Path.cwd()
+          today = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()
+          logs = {
+              "swift": ("✘ Test rejectsEmpty() failed after 0.001 seconds with 1 issue.\n", "✔ Test happyPath() passed after 0.001 seconds.\n"),
+              "python": (
+                  "FAILED test_example.py::test_rejects_invalid_input - AssertionError\n"
+                  "FAILED test_example.py::test_happy_path_asserts - AssertionError\n"
+                  "FAILED test_example.py::test_rejects_invalid_input - AssertionError\n"
+                  "FAILED test_example.py::test_with_invalid_email - AssertionError\n"
+                  "1 passed, 3 failed in 0.05s\n",
+                  "PASSED test_example.py::test_happy_path\n1 passed in 0.05s\n",
+              ),
+              "go": ("--- FAIL: TestRejectsEmpty (0.00s)\n", "--- PASS: TestHappyPath (0.00s)\n"),
+              "rust": ("test test_rejects_empty ... FAILED\n", "test test_happy_path ... ok\n"),
+          }
+
+          def check_report(language, log, failed, expected_exit, process_exit=None):
+              with tempfile.TemporaryDirectory() as tmp:
+                  sandbox = Path(tmp)
+                  shutil.copytree(root / "bin", sandbox / "bin")
+                  report_dir = sandbox / "docs" / "reports" / today
+                  report_dir.mkdir(parents=True)
+                  args = ["bash", str(sandbox / "bin" / "render_report.sh"), "--language", language]
+                  if process_exit is None:
+                      (report_dir / "log.txt").write_text(log, encoding="utf-8")
+                      args.append("--collect")
+                  else:
+                      (sandbox / "fixture.log").write_text(log, encoding="utf-8")
+                      args += ["--test-command", f"cat fixture.log; exit {process_exit}"]
+                  result = subprocess.run(args, capture_output=True, text=True)
+                  context = f"{language} process_exit={process_exit} failed={failed}: {result.stderr}"
+                  assert result.returncode == expected_exit, context
+                  summary = json.loads((report_dir / "summary.json").read_text(encoding="utf-8"))
+                  assert summary["failed"] == failed, (context, summary)
+                  assert summary["exit_code"] == expected_exit, (context, summary)
+                  verdict = "✅ PASS" if expected_exit == 0 else f"❌ FAIL (exit {expected_exit})"
+                  report = (report_dir / "report.md").read_text(encoding="utf-8")
+                  assert f"**Result:** {verdict}" in report, (context, report)
+
+          for language, (failing_log, passing_log) in logs.items():
+              failed = 3 if language == "python" else 1
+              check_report(language, failing_log, failed, 1)
+              check_report(language, passing_log, 0, 0)
+
+          failing_log, passing_log = logs["python"]
+          check_report("python", failing_log, 3, 1, process_exit=0)
+          check_report("python", failing_log, 3, 3, process_exit=3)
+          check_report("python", "runner crashed\n", 0, 3, process_exit=3)
+          check_report("python", passing_log, 0, 0, process_exit=0)
+          print("render_report: 12 verdict cases passed")
+          PY
+      - name: check_drift swift public final class
+        # LOGIC-04: the type rule required public to be followed immediately
+        # by struct/class/enum/protocol, so public final class was invisible
+        # and a file containing only that declaration failed open.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged file whose only declaration is public final class.
+          printf 'public final class FinalOnly {}\n' > Sources/CaffCore/Probe.swift
+          git add Sources/CaffCore/Probe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q ':FinalOnly'
+          if printf '%s\n' "$out" | grep -q 'drift: clean'; then
+            echo "error: public final class failed open (drift: clean)" >&2
+            exit 1
+          fi
+          git reset HEAD -- Sources/CaffCore/Probe.swift 2>/dev/null || true
+
+          # 2) Documented sibling public struct must not hide FinalOnly.
+          printf 'public final class FinalOnly {}\npublic struct PlainProbe {}\n' > Sources/CaffCore/Probe.swift
+          printf '\nPlainProbe\n' >> "$kb"
+          git add Sources/CaffCore/Probe.swift "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q ':FinalOnly'
+          if printf '%s\n' "$out" | grep -q ':PlainProbe'; then
+            echo "error: documented PlainProbe listed as missing" >&2
+            exit 1
+          fi
+          git reset HEAD -- Sources/CaffCore/Probe.swift "$kb" 2>/dev/null || true
+          git checkout HEAD -- "$kb"
+          rm -rf Sources/CaffCore
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
