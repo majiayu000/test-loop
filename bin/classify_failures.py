@@ -132,7 +132,7 @@ EXTRACT_PATTERNS: dict[str, re.Pattern[str]] = {
         re.MULTILINE,
     ),
     "python": re.compile(
-        r"^FAILED\s+\S*::?([A-Za-z_][A-Za-z0-9_]*)",  # pytest short summary
+        r"^FAILED\s+(.+::.+)$",  # complete pytest node ID and optional trailer
         re.MULTILINE,
     ),
     "go": re.compile(
@@ -184,6 +184,27 @@ def resolve_language(log_text: str, language: str) -> str:
     return language
 
 
+def pytest_node_id(text: str, headlines: Iterable[str] = ()) -> str:
+    """Remove the assertion trailer while preserving the complete node ID."""
+    path, separator, test = text.partition("::")
+    if not separator:
+        return text.split(" - ", 1)[0]
+    # Failure headlines give the complete test name even when its parameter
+    # ID contains delimiters. Use that evidence before inspecting the trailer.
+    for headline in sorted(headlines, key=len, reverse=True):
+        if test == headline or test.startswith(headline + " - "):
+            return path + separator + headline
+    if "[" in test.split(" - ", 1)[0]:
+        # The reason begins with an assertion or exception label; a later
+        # closing bracket in arbitrary reason text does not end the node ID.
+        trailer = re.search(r"\] - (?=assert\b|[\w.]+(?::|$))", test)
+        if trailer:
+            test = test[:trailer.start() + 1]
+    else:
+        test = test.split(" - ", 1)[0]
+    return path + separator + test
+
+
 def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     """Pull failing test names out of a test log, deduplicated.
 
@@ -196,15 +217,20 @@ def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     """
     language = resolve_language(log_text, language)
     rx = EXTRACT_PATTERNS[language]
+    headlines = re.findall(r"^_+ (.+?) _+$", log_text, re.MULTILINE) if language == "python" else []
     seen: dict[str, None] = {}
     for m in rx.finditer(log_text):
         name = m.group(1).strip()
+        if language == "python":
+            name = pytest_node_id(name, headlines)
         if name and name not in seen:
             seen[name] = None
     return list(seen.keys())
 
 
 def classify(name: str, language: str = "swift") -> str:
+    if language == "python":
+        name = (name.partition("::")[2] or name).split("[", 1)[0].rsplit("::", 1)[-1]
     patterns = PATTERNS.get(language, [])
     for label, rx in patterns:
         if rx.search(name):
@@ -251,7 +277,7 @@ def main(argv: list[str]) -> int:
         print("error: log file required", file=sys.stderr)
         return 2
 
-    with open(log_path, "r", encoding="utf-8") as f:
+    with open(log_path, "r", encoding="utf-8", errors="backslashreplace") as f:
         log_text = f.read()
 
     try:
@@ -413,7 +439,7 @@ FAILED test_module.py::test_rejects_invalid_input
         # we still dedupe.
         self.assertEqual(
             names,
-            ["test_rejects_invalid_input", "test_handles_missing_data"],
+            ["test_module.py::test_rejects_invalid_input", "test_module.py::test_handles_missing_data"],
         )
 
     def test_classify_python_routes_expected_failure(self) -> None:
@@ -588,7 +614,7 @@ FAILED test_module.py::test_handles_missing_data
         self.assertEqual(detect_language(log), "python")
         self.assertEqual(
             extract_failing_names(log, language="auto"),
-            ["test_rejects_invalid_input", "test_handles_missing_data"],
+            ["test_module.py::test_rejects_invalid_input", "test_module.py::test_handles_missing_data"],
         )
 
     def test_auto_detects_go(self) -> None:

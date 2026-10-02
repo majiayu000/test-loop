@@ -696,6 +696,465 @@ jobs:
             docs/knowledge/L1_chain.md 2>/dev/null || true
           rm -rf Sources/CaffCore docs/knowledge/L1_chain_target.md \
             docs/knowledge/L1_chain_middle.md docs/knowledge/L1_chain.md
+      - name: pytest report counts and failing names
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          failure = "FAILED test_example.py::{} - AssertionError\n"
+          names = ["test_rejects_invalid_input", "test_happy_path_asserts", "test_with_invalid_email"]
+          cases = [
+              ("issue-8", "".join(failure.format(name) for name in [*names[:2], names[0], names[2]])
+               + "========================= 1 passed, 3 failed in 0.05s ==========================\n",
+               (4, 1, 3), ["test_example.py::" + name for name in names]),
+              ("passing", "3 passed in 0.01s\n", (3, 3, 0), []),
+              ("failing", failure.format("test_z") + failure.format("test_a")
+               + "2 failed in 0.01s\n", (2, 0, 2), ["test_example.py::test_z", "test_example.py::test_a"]),
+              ("failed-first", failure.format("test_z") + "1 failed, 2 passed in 0.01s\n",
+               (3, 2, 1), ["test_example.py::test_z"]),
+              ("explicit-passed", "PASSED test_example.py::test_ok\n" + failure.format("test_z") * 2
+               + "1 failed, 1 passed in 0.01s\n", (2, 1, 1), ["test_example.py::test_z"]),
+              ("no-summary", "PASSED test_example.py::test_ok\n" + failure.format("test_z"),
+               (2, 1, 1), ["test_example.py::test_z"]),
+              ("test-ids", failure.format("TestExample::test_value[a]") * 2
+               + failure.format("TestExample::test_value[b]") + "2 failed in 0.01s\n",
+               (2, 0, 2), ["test_example.py::TestExample::test_value[a]", "test_example.py::TestExample::test_value[b]"]),
+              ("multiple-runs", "8 passed in 0.01s\n" + failure.format("test_z")
+               + "1 failed, 2 passed in 0.02s\n", (11, 10, 1), ["test_example.py::test_z"]),
+              ("parameter-delimiter", "FAILED test_params.py::test_value[a - b] - assert data == ['a - b']\n" * 2
+               + "FAILED test_params.py::test_value[a - c] - assert False\n2 failed in 0.01s\n",
+               (2, 0, 2), ["test_params.py::test_value[a - b]", "test_params.py::test_value[a - c]"]),
+              ("same-name-modules", "FAILED tests/a/test_api.py::test_shared - AssertionError\n"
+               + "FAILED tests/b/test_api.py::test_shared - AssertionError\n2 failed in 0.01s\n",
+               (2, 0, 2), ["tests/a/test_api.py::test_shared", "tests/b/test_api.py::test_shared"]),
+              ("failure-then-pass", failure.format("test_z") + "1 failed in 0.01s\n2 passed in 0.02s\n",
+               (3, 2, 1), ["test_example.py::test_z"]),
+              ("path-delimiter", "FAILED tests/a - b/test_params.py::test_value - assert False\n"
+               + "FAILED tests/a - c/test_params.py::test_value - assert False\n2 failed in 0.01s\n",
+               (2, 0, 2), ["tests/a - b/test_params.py::test_value", "tests/a - c/test_params.py::test_value"]),
+              ("closing-bracket-id", "FAILED test_params.py::test_value[a] - b] - assert False\n" * 2
+               + "FAILED test_params.py::test_value[a] - c] - assert False\n2 failed in 0.01s\n",
+               (2, 0, 2), ["test_params.py::test_value[a] - b]", "test_params.py::test_value[a] - c]"]),
+              ("incomplete-then-pass", "FAILED first/test_api.py::test_z - AssertionError\n2 passed in 0.02s\n",
+               (3, 2, 1), ["first/test_api.py::test_z"]),
+              ("pass-then-incomplete", "2 passed in 0.02s\n" + failure.format("test_z") * 2,
+               (3, 2, 1), ["test_example.py::test_z"]),
+              ("session-boundary", "FAILED first/test_api.py::test_z - AssertionError\n"
+               + "=================== test session starts ===================\n"
+               + failure.format("test_z") + "1 failed, 2 passed in 0.02s\n",
+               (4, 2, 2), ["first/test_api.py::test_z", "test_example.py::test_z"]),
+              ("incomplete-then-failing-quiet", failure.format("test_z")
+               + "F [100%]\n=================== FAILURES ===================\n"
+               + "=================== short test summary info ===================\n"
+               + failure.format("test_z") + "1 failed in 0.02s\n",
+               (2, 0, 2), ["test_example.py::test_z"]),
+              ("uncaptured-stdout", "=================== test session starts ===================\n"
+               + "test_example.py \n10 passed in 0.50s\n.\n\n"
+               + "=================== 1 passed in 0.01s ===================\n", (1, 1, 0), []),
+              ("uncaptured-stdout-quiet", "\n10 passed in 0.50s\n.\n1 passed in 0.01s\n", (1, 1, 0), []),
+              ("assertion-delimiter", "FAILED test_ids.py::test_value[a] - b] - AssertionError: whoops] - tail\n"
+               + "FAILED test_ids.py::test_value[a] - b] - AssertionError: other] - tail\n"
+               + "1 failed in 0.01s\n", (1, 0, 1), ["test_ids.py::test_value[a] - b]"]),
+              ("raw-bytes", b"\xff\n.\n1 passed in 0.01s\n", (1, 1, 0), []),
+              ("captured-stdout", "F [100%]\n=================== FAILURES ===================\n"
+               + "___________________ test_value ___________________\n"
+               + "------------------- Captured stdout call -------------------\n10 passed in 0.50s\n"
+               + "=================== short test summary info ===================\n"
+               + failure.format("test_value") + "1 failed in 0.01s\n",
+               (1, 0, 1), ["test_example.py::test_value"]),
+          ]
+          source = Path.cwd()
+          day = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()
+          for label, log, counts, expected_names in cases:
+              log_bytes = log.encode() if isinstance(log, str) else log
+              for mode in ("collect", "live"):
+                  with tempfile.TemporaryDirectory(prefix="pytest-report-") as temp:
+                      repo = Path(temp)
+                      shutil.copytree(source / "bin", repo / "bin")
+                      report_dir = repo / "docs/reports" / day
+                      report_dir.mkdir(parents=True)
+                      if mode == "collect":
+                          (report_dir / "log.txt").write_bytes(log_bytes)
+                          args = ["--collect"]
+                      else:
+                          (repo / "input.log").write_bytes(log_bytes)
+                          args = ["--test-command", "cat input.log; exit 3"]
+                      result = subprocess.run(
+                          ["bash", str(repo / "bin/render_report.sh"), "--language", "python", *args],
+                          capture_output=True,
+                      )
+                      summary = json.loads((report_dir / "summary.json").read_text())
+                      report = (report_dir / "report.md").read_text()
+                      actual = tuple(summary[key] for key in ("total", "passed", "failed"))
+                      assert actual == counts, (label, mode, actual, counts)
+                      assert f"**Counts:** total={counts[0]} passed={counts[1]} failed={counts[2]}" in report
+                      assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == expected_names, (label, mode, report)
+                      classified = json.loads((report_dir / "classify.json").read_text())
+                      assert classified["failures"] == expected_names, (label, mode, classified)
+                      grouped = summary["failures_grouped"]
+                      assert sorted(name for group in grouped.values() for name in group) == sorted(expected_names)
+                      assert sum(summary["failures_by_class"].values()) == len(expected_names)
+                      assert summary["exit_code"] == result.returncode, (label, mode, result.stderr)
+                      if label == "multiple-runs":
+                          assert summary["run_line"] == "8 passed in 0.01s; 1 failed, 2 passed in 0.02s"
+                      if label == "failure-then-pass":
+                          assert summary["run_line"] == "1 failed in 0.01s; 2 passed in 0.02s"
+                      if mode == "live":
+                          assert result.returncode == 3, (label, result.stderr)
+                      assert (report_dir / "log.txt").read_bytes() == log_bytes
+                      print(f"PASS: {label} ({mode})")
+          PY
+      - name: pytest output and classifier failure boundaries
+        run: |
+          python3 -m pip install pytest
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shlex
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          source = Path.cwd()
+          day = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()
+          cases = [
+              ("stdout", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-s", (1, 1, 0), []),
+              ("stdout-quiet", "def test_output():\n    print('\\n10 passed in 0.50s')\n", "-q -s", (1, 1, 0), []),
+              ("decorated-stdout", "def test_output():\n    print('\\n================ 10 passed in 0.50s ================')\n",
+               "-s", (1, 1, 0), []),
+              ("decorated-stdout-quiet", "def test_output():\n    print('\\n================ 10 passed in 0.50s ================')\n",
+               "-q -s", (1, 1, 0), []),
+              ("decorated-captured", "def test_output():\n    print('================ 10 passed in 0.50s ================')\n"
+               + "    assert False\n", "-q", (1, 0, 1), ["test_boundary.py::test_output"]),
+              ("warnings", "import warnings\ndef test_output():\n    warnings.warn('one warning')\n", "-q", (1, 1, 0), []),
+              ("warnings-stdout", "import warnings\ndef test_output():\n    print('\\n10 passed in 0.50s')\n"
+               + "    warnings.warn('one warning')\n", "-q -s", (1, 1, 0), []),
+              ('teardown', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n", '-s', (1, 1, 0), []),
+              ('teardown-quiet', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
+              ('teardown-cleanup', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
+              ('teardown-decorated', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n================ 10 passed in 0.50s ================')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
+              ('teardown-blank', "import pytest\n@pytest.fixture\ndef resource():\n    yield\n    print('\\n\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n", '-q -s', (1, 1, 0), []),
+              ("atexit-quiet", "import atexit\natexit.register(lambda: print('10 passed in 0.50s'))\n"
+               + "def test_output():\n    pass\n", "-q -s", (1, 1, 0), []),
+              ("atexit-normal", "import atexit\natexit.register(lambda: print('10 passed in 0.50s'))\n"
+               + "def test_output():\n    pass\n", "-s", (1, 1, 0), []),
+              ("atexit-captured", "import atexit\natexit.register(lambda: print('10 passed in 0.50s'))\n"
+               + "def test_output():\n    pass\n", "-q", (1, 1, 0), []),
+              ("compound-quiet", "def test_output():\n    pass\n", "-q -s", (1, 1, 0), []),
+              ("compound-normal", "def test_output():\n    pass\n", "-s", (1, 1, 0), []),
+              ("compound-captured", "def test_output():\n    pass\n", "-q", (1, 1, 0), []),
+              ("compound-cleanup", "def test_output():\n    pass\n", "-q -s", (1, 1, 0), []),
+              ("teardown-atexit", "import atexit\nimport pytest\n"
+               + "atexit.register(lambda: print('10 passed in 0.50s'))\n@pytest.fixture\ndef resource():\n"
+               + "    yield\n    print('\\n10 passed in 0.50s')\ndef test_output(resource):\n    pass\n",
+               "-q -s", (1, 1, 0), []),
+              ("bytes", "import os\ndef test_output():\n    os.write(1, b'\\xff\\n')\n", "-q -s", (1, 1, 0), []),
+              ("ids", "import pytest\n@pytest.mark.parametrize('x', [1, 2], ids=['a] - b', 'a] - c'])\n"
+               + "def test_output(x):\n    raise AssertionError('whoops] - tail')\n", "-q", (2, 0, 2),
+               ["test_boundary.py::test_output[a] - b]", "test_boundary.py::test_output[a] - c]"]),
+          ]
+          for label, test_source, flags, counts, names in cases:
+              with tempfile.TemporaryDirectory() as temp:
+                  repo = Path(temp)
+                  shutil.copytree(source / "bin", repo / "bin")
+                  (repo / "test_boundary.py").write_text(test_source)
+                  command = shlex.quote(sys.executable) + " -m pytest --color=no " + flags
+                  command += " test_boundary.py"
+                  if label.startswith("warnings") or label == "teardown-cleanup":
+                      command += "; echo cleanup"
+                  if label == "compound-cleanup":
+                      command += "; echo cleanup"
+                  if label.startswith("compound"):
+                      command += "; printf '10 passed in 0.50s\\n'"
+                  run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", "--test-command", command],
+                                       cwd=repo, capture_output=True, env=os.environ | {"CI": "true"})
+                  artifacts = repo / "docs/reports" / day
+                  raw = (artifacts / "log.txt").read_bytes()
+                  assert raw == run.stdout
+                  assert run.returncode == (1 if names else 0), (label, run.stderr)
+                  if label == "bytes":
+                      assert b"\xff" in raw
+                  for mode in ("live", "collect"):
+                      if mode == "collect":
+                          run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", "--collect"],
+                                               cwd=repo, capture_output=True)
+                      summary = json.loads((artifacts / "summary.json").read_text())
+                      report = (artifacts / "report.md").read_text()
+                      classified = json.loads((artifacts / "classify.json").read_text())
+                      assert tuple(summary[k] for k in ("total", "passed", "failed")) == counts, (label, mode, summary)
+                      if label.startswith(("teardown", "atexit", "compound")):
+                          assert "10 passed" not in summary["run_line"], (label, mode, summary)
+                      if label.startswith(("atexit", "compound")) or label == "teardown-atexit":
+                          assert raw.endswith(b"10 passed in 0.50s\n")
+                      if label == "teardown-cleanup":
+                          assert raw.endswith(b"cleanup\n")
+                      if label.startswith("warnings"):
+                          assert re.match(r"^1 passed, 1 warning in ", summary["run_line"]), (label, mode, summary)
+                          assert raw.endswith(b"cleanup\n")
+                      assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == names
+                      assert classified["failures"] == names and not summary.get("classify_error")
+                      assert summary["exit_code"] == run.returncode
+                      assert (artifacts / "log.txt").read_bytes() == raw
+                      print(f"PASS: actual pytest {label} ({mode})")
+          for breakage in ("missing", "syntax", "import"):
+              for failed in (False, True):
+                  for mode in ("collect", "live"):
+                      with tempfile.TemporaryDirectory() as temp:
+                          repo = Path(temp)
+                          shutil.copytree(source / "bin", repo / "bin")
+                          classifier = repo / "bin/classify_failures.py"
+                          if breakage == "missing":
+                              classifier.unlink()
+                          elif breakage == "syntax":
+                              classifier.write_text("invalid syntax !\n")
+                          else:
+                              classifier.write_text("raise RuntimeError('import failure')\n")
+                          log = b"FAILED test_a.py::test_fail - AssertionError\n1 failed in 0.01s\n" if failed else b"1 passed in 0.01s\n"
+                          artifacts = repo / "docs/reports" / day
+                          artifacts.mkdir(parents=True)
+                          if mode == "collect":
+                              (artifacts / "log.txt").write_bytes(log)
+                              args = ["--collect"]
+                          else:
+                              (repo / "input.log").write_bytes(log)
+                              args = ["--test-command", "cat input.log; exit 3"]
+                          run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", *args],
+                                               cwd=repo, capture_output=True)
+                          summary = json.loads((artifacts / "summary.json").read_text())
+                          assert summary["classify_error"] and summary["exit_code"] == run.returncode
+                          assert tuple(summary[k] for k in ("total", "passed", "failed")) == (1, int(not failed), int(failed))
+                          assert (artifacts / "report.md").exists() and (artifacts / "classify.err").stat().st_size
+                          assert b"classify_failures.py failed" in run.stderr
+                          assert (artifacts / "log.txt").read_bytes() == log
+                          if mode == "live":
+                              assert run.returncode == 3
+                          print(f"PASS: degraded {breakage} failed={failed} ({mode})")
+              for mode in ("collect", "live"):
+                  with tempfile.TemporaryDirectory() as temp:
+                      repo = Path(temp)
+                      shutil.copytree(source / "bin", repo / "bin")
+                      classifier = repo / "bin/classify_failures.py"
+                      if breakage == "missing":
+                          classifier.unlink()
+                      elif breakage == "syntax":
+                          classifier.write_text("invalid syntax !\n")
+                      else:
+                          classifier.write_text("raise RuntimeError('import failure')\n")
+                      node = "tests/a - b/test_a.py::test_value[a] - b]"
+                      log = ("___________________ test_value[a] - b] ___________________\n"
+                             + "FAILED " + node + " - AssertionError: whoops] - tail\n"
+                             + "FAILED " + node + " - AssertionError: other] - tail\n"
+                             + "1 failed in 0.01s\n").encode()
+                      artifacts = repo / "docs/reports" / day
+                      artifacts.mkdir(parents=True)
+                      if mode == "collect":
+                          (artifacts / "log.txt").write_bytes(log)
+                          args = ["--collect"]
+                      else:
+                          (repo / "input.log").write_bytes(log)
+                          args = ["--test-command", "cat input.log; exit 3"]
+                      run = subprocess.run(["bash", "bin/render_report.sh", "--language", "python", *args],
+                                           cwd=repo, capture_output=True)
+                      summary = json.loads((artifacts / "summary.json").read_text())
+                      report = (artifacts / "report.md").read_text()
+                      assert summary["classify_error"] and summary["exit_code"] == run.returncode
+                      assert tuple(summary[k] for k in ("total", "passed", "failed")) == (1, 0, 1)
+                      assert re.findall(r"^- `([^`]+)`$", report, re.MULTILINE) == [node]
+                      assert (artifacts / "classify.err").stat().st_size and b"classify_failures.py failed" in run.stderr
+                      assert (artifacts / "log.txt").read_bytes() == log
+                      if mode == "live":
+                          assert run.returncode == 3
+                      print(f"PASS: degraded duplicate {breakage} ({mode})")
+          PY
+      - name: render_report collect and live verdicts
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+
+          root = Path.cwd()
+          today = subprocess.check_output(["date", "+%Y-%m-%d"], text=True).strip()
+          logs = {
+              "swift": ("✘ Test rejectsEmpty() failed after 0.001 seconds with 1 issue.\n", "✔ Test happyPath() passed after 0.001 seconds.\n"),
+              "python": (
+                  "FAILED test_example.py::test_rejects_invalid_input - AssertionError\n"
+                  "FAILED test_example.py::test_happy_path_asserts - AssertionError\n"
+                  "FAILED test_example.py::test_rejects_invalid_input - AssertionError\n"
+                  "FAILED test_example.py::test_with_invalid_email - AssertionError\n"
+                  "1 passed, 3 failed in 0.05s\n",
+                  "PASSED test_example.py::test_happy_path\n1 passed in 0.05s\n",
+              ),
+              "go": ("--- FAIL: TestRejectsEmpty (0.00s)\n", "--- PASS: TestHappyPath (0.00s)\n"),
+              "rust": ("test test_rejects_empty ... FAILED\n", "test test_happy_path ... ok\n"),
+          }
+
+          def check_report(language, log, failed, expected_exit, process_exit=None):
+              with tempfile.TemporaryDirectory() as tmp:
+                  sandbox = Path(tmp)
+                  shutil.copytree(root / "bin", sandbox / "bin")
+                  report_dir = sandbox / "docs" / "reports" / today
+                  report_dir.mkdir(parents=True)
+                  args = ["bash", str(sandbox / "bin" / "render_report.sh"), "--language", language]
+                  if process_exit is None:
+                      (report_dir / "log.txt").write_text(log, encoding="utf-8")
+                      args.append("--collect")
+                  else:
+                      (sandbox / "fixture.log").write_text(log, encoding="utf-8")
+                      args += ["--test-command", f"cat fixture.log; exit {process_exit}"]
+                  result = subprocess.run(args, capture_output=True, text=True)
+                  context = f"{language} process_exit={process_exit} failed={failed}: {result.stderr}"
+                  assert result.returncode == expected_exit, context
+                  summary = json.loads((report_dir / "summary.json").read_text(encoding="utf-8"))
+                  assert summary["failed"] == failed, (context, summary)
+                  assert summary["exit_code"] == expected_exit, (context, summary)
+                  verdict = "✅ PASS" if expected_exit == 0 else f"❌ FAIL (exit {expected_exit})"
+                  report = (report_dir / "report.md").read_text(encoding="utf-8")
+                  assert f"**Result:** {verdict}" in report, (context, report)
+
+          for language, (failing_log, passing_log) in logs.items():
+              failed = 3 if language == "python" else 1
+              check_report(language, failing_log, failed, 1)
+              check_report(language, passing_log, 0, 0)
+
+          failing_log, passing_log = logs["python"]
+          check_report("python", failing_log, 3, 1, process_exit=0)
+          check_report("python", failing_log, 3, 3, process_exit=3)
+          check_report("python", "runner crashed\n", 0, 3, process_exit=3)
+          check_report("python", passing_log, 0, 0, process_exit=0)
+          print("render_report: 12 verdict cases passed")
+          PY
+      - name: check_drift swift public final class
+        # LOGIC-04: the type rule required public to be followed immediately
+        # by struct/class/enum/protocol, so public final class was invisible
+        # and a file containing only that declaration failed open.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged file whose only declaration is public final class.
+          printf 'public final class FinalOnly {}\n' > Sources/CaffCore/Probe.swift
+          git add Sources/CaffCore/Probe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q ':FinalOnly'
+          if printf '%s\n' "$out" | grep -q 'drift: clean'; then
+            echo "error: public final class failed open (drift: clean)" >&2
+            exit 1
+          fi
+          git reset HEAD -- Sources/CaffCore/Probe.swift 2>/dev/null || true
+
+          # 2) Documented sibling public struct must not hide FinalOnly.
+          printf 'public final class FinalOnly {}\npublic struct PlainProbe {}\n' > Sources/CaffCore/Probe.swift
+          printf '\nPlainProbe\n' >> "$kb"
+          git add Sources/CaffCore/Probe.swift "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q ':FinalOnly'
+          if printf '%s\n' "$out" | grep -q ':PlainProbe'; then
+            echo "error: documented PlainProbe listed as missing" >&2
+            exit 1
+          fi
+          git reset HEAD -- Sources/CaffCore/Probe.swift "$kb" 2>/dev/null || true
+          git checkout HEAD -- "$kb"
+          rm -rf Sources/CaffCore
+      - name: check_drift Python public async and private names
+        run: |
+          python3 - <<'PY'
+          import shutil
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp)
+              (root / "bin").mkdir()
+              shutil.copy2("bin/check_drift.sh", root / "bin/check_drift.sh")
+              subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+              subprocess.run([
+                  "git", "-c", "user.name=Self Check",
+                  "-c", "user.email=self-check@example.invalid",
+                  "commit", "--allow-empty", "-qm", "baseline",
+              ], cwd=root, check=True)
+
+              def check(source, public, documented=()):
+                  (root / "api.py").write_text(source)
+                  (root / "knowledge.md").write_text("\n".join(documented))
+                  subprocess.run([
+                      "git", "add", "api.py", "knowledge.md",
+                  ], cwd=root, check=True)
+                  # The staged declaration must win over a different worktree.
+                  (root / "api.py").write_text("def _worktree_only(): pass\n")
+                  result = subprocess.run([
+                      "bin/check_drift.sh", "--staged", "--language", "python",
+                      "--source-glob", "api.py", "--knowledge-base", "knowledge.md",
+                  ], cwd=root, capture_output=True, text=True)
+                  print(result.stdout, end="")
+                  missing = public - set(documented)
+                  assert result.returncode == int(bool(missing)), result
+                  actual = {
+                      line.split(":", 1)[1]
+                      for line in result.stdout.splitlines()
+                      if line.startswith("  - api.py:")
+                  }
+                  assert actual == missing, (actual, missing, result)
+                  assert f"scanned {len(public)} public symbol(s)" in result.stdout, result
+                  assert ("drift: clean" in result.stdout) == (not missing), result
+
+              check("async def fetch_public(): pass\n", {"fetch_public"})
+              check(
+                  "def _private_helper(): pass\n"
+                  "async def _private_async(): pass\n"
+                  "class _PrivateType: pass\n",
+                  set(),
+              )
+              mixed = (
+                  "# def commented_public(): pass\n"
+                  "# async def commented_async(): pass\n"
+                  "# class CommentedType: pass\n"
+                  "async\tdef fetch_public(): pass\n"
+                  "def public_sync_2():\n"
+                  "    def nested_public(): pass\n"
+                  "    async def nested_async(): pass\n"
+                  "    class NestedType: pass\n"
+                  "class PublicType_2:\n"
+                  "    def member_public(self): pass\n"
+                  "    async def member_async(self): pass\n"
+                  "def _private_helper(): pass\n"
+                  "class _PrivateType: pass\n"
+              )
+              public = {"fetch_public", "public_sync_2", "PublicType_2"}
+              check(mixed, public)
+              check(mixed, public, public)
+              check(mixed, public, {"fetch_public", "PublicType_2"})
+          PY
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized
