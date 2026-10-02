@@ -756,6 +756,57 @@ jobs:
           check_report("python", passing_log, 0, 0, process_exit=0)
           print("render_report: 12 verdict cases passed")
           PY
+      - name: check_drift swift public final class
+        # LOGIC-04: the type rule required public to be followed immediately
+        # by struct/class/enum/protocol, so public final class was invisible
+        # and a file containing only that declaration failed open.
+        run: |
+          set -euo pipefail
+          mkdir -p Sources/CaffCore
+          kb=templates/knowledge/L1_modules.md
+
+          # 1) Staged file whose only declaration is public final class.
+          printf 'public final class FinalOnly {}\n' > Sources/CaffCore/Probe.swift
+          git add Sources/CaffCore/Probe.swift
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q ':FinalOnly'
+          if printf '%s\n' "$out" | grep -q 'drift: clean'; then
+            echo "error: public final class failed open (drift: clean)" >&2
+            exit 1
+          fi
+          git reset HEAD -- Sources/CaffCore/Probe.swift 2>/dev/null || true
+
+          # 2) Documented sibling public struct must not hide FinalOnly.
+          printf 'public final class FinalOnly {}\npublic struct PlainProbe {}\n' > Sources/CaffCore/Probe.swift
+          printf '\nPlainProbe\n' >> "$kb"
+          git add Sources/CaffCore/Probe.swift "$kb"
+          set +e
+          out=$(bin/check_drift.sh \
+            --staged \
+            --source-glob 'Sources/CaffCore' \
+            --knowledge-base "$kb" \
+            --language swift 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1
+          printf '%s\n' "$out" | grep -q ':FinalOnly'
+          if printf '%s\n' "$out" | grep -q ':PlainProbe'; then
+            echo "error: documented PlainProbe listed as missing" >&2
+            exit 1
+          fi
+          git reset HEAD -- Sources/CaffCore/Probe.swift "$kb" 2>/dev/null || true
+          git checkout HEAD -- "$kb"
+          rm -rf Sources/CaffCore
       - name: Failure classifier self-test
         run: python3 bin/classify_failures.py --self-test
       - name: Skill copies are synchronized

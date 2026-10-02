@@ -8,8 +8,9 @@ A small, language-agnostic toolkit for the **closed test loop**:
 drift detection, failure classification, structured reports, a pre-commit
 guardrail, and a CI workflow you can copy into any project.
 
-> Status: design phase. Skills and their contracts are written; the
-> script preview, copyable templates, and self-check workflow are tracked in
+> Status: skills and a working script preview. Target projects still need
+> their own language globs, test commands, and knowledge-base content. The
+> copyable templates and self-check workflow are tracked in
 > [docs/knowledge/L0_overview.md](docs/knowledge/L0_overview.md).
 
 ## What it is
@@ -66,12 +67,62 @@ cp -R bin scripts templates docs/knowledge /path/to/your-project/
 v0.1.0 does not provide a polished installer yet. Treat `bin/` and `templates/`
 as a working preview that still needs project-specific adaptation.
 
+## Generate a report from your test runner
+
+After copying the preview scripts into a target project, run from that project's
+root. Install its normal test dependencies first. `render_report.sh` invokes
+the selected command and writes `log.txt`, `summary.json`, `classify.json`, and
+`report.md` under `docs/reports/<date>/`:
+
+```sh
+# Include pytest's passed and failed short-summary entries.
+bash bin/render_report.sh --language python --test-command 'python -m pytest -q -rA'
+
+# Include Go's per-test PASS/FAIL lines.
+bash bin/render_report.sh --language go --test-command 'go test -v ./...'
+
+# Cargo emits the per-test lines used by the Rust parser.
+bash bin/render_report.sh --language rust --test-command 'cargo test --no-fail-fast'
+```
+
+The default language is Swift and the default command is
+`swift test --parallel`. The checked-in [CI template](templates/github/test.yml)
+is a Swift/macOS starting point: adapt its runner, build command, and report
+invocation for your target project. Retain its `if: always()` artifact upload
+so a failed test run still leaves evidence.
+
+### Why does a passing report show zero tests?
+
+This preview parses text, not JUnit or the test framework's internal results.
+Quiet pytest output omits passed-test summary entries; default Go output omits
+individual passing tests. Use the explicit commands above, then compare the
+raw log, `run_line`, counts, and `exit_code` in `summary.json`. Collection errors,
+unsupported log formats, and indented subtests can be missing from the per-test
+counts. A zero count is not evidence that the suite passed or ran nothing.
+See [pytest's summary options](https://docs.pytest.org/en/stable/how-to/output.html#producing-a-detailed-summary-report)
+and the [report skill contract](.agents/skills/report-render/SKILL.md).
+
+### Does `EXPECTED_FAILURE` mean I can ignore a failed test?
+
+No. Classification uses the **test name**, not its body or assertion result.
+`EXPECTED_FAILURE` describes a test intended to verify rejection; a runner
+failure in that test can mean the rejection contract is broken. It is not
+pytest's `xfail` status and does not turn a red suite green. The renderer returns
+the underlying test command's exit code. Read the raw failure before deciding
+what to fix, and use the [failure-classification skill](.agents/skills/failure-classify/SKILL.md)
+and [taxonomy](templates/knowledge/L2_equivalence_classes.md).
+
+`--collect` only renders the existing date-based `log.txt`; it does not rerun
+tests and sets the command exit code to zero. Do not use a collect-only exit as
+proof that the original test command succeeded. The generated report is an
+inspection aid; retain the original runner result as the CI gate.
+
 ## Relationship to other projects
 
 | Project | Relationship |
 | --- | --- |
-| [aitest-kit](../aitest-kit) | A deeper, Python-specific toolchain that *compiles* Markdown test designs into pytest code. test-loop is the lighter sibling: no codegen, no module profile, no emitter. |
-| [caff](../caff) | A macOS menu bar app where this loop was first built out end-to-end. caff 0.1.4 ships the loop in its own `scripts/`, `docs/knowledge/`, `.githooks/`, and `.github/workflows/`. test-loop generalises what caff proved. |
+| `aitest-kit` | A deeper, Python-specific toolchain that *compiles* Markdown test designs into pytest code. test-loop is the lighter sibling: no codegen, no module profile, no emitter. No public repository link is currently available. |
+| [caff](https://github.com/majiayu000/caff) | A macOS menu bar app where this loop was first built out end-to-end. caff 0.1.4 ships the loop in its own `scripts/`, `docs/knowledge/`, `.githooks/`, and `.github/workflows/`. test-loop generalises what caff proved. |
 
 ## Skills (the entry points)
 
@@ -119,9 +170,10 @@ that pattern that you copy once and reuse, with the five pieces
 kept in lock-step across Claude Code, Codex, and generic agents.
 
 **`test-loop` vs. a test framework (Swift Testing, pytest, go test, …).**
-test-loop does not run tests; it sits around the test runner and
-inspects its inputs and outputs. Use the framework for the test, use
-test-loop for the loop.
+test-loop does not implement a test framework. The report script invokes
+your selected runner and inspects its output; the other tools inspect the
+surrounding source, documentation, and workflow. Use the framework for the
+tests and test-loop for the loop.
 
 ## Roadmap
 
