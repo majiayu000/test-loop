@@ -67,14 +67,9 @@ case "$LANGUAGE" in
         ;;
     python)
         # pytest short summary lines are "FAILED test_module.py::test_name".
-        # The full per-test lines are "test_module.py F" etc. We treat each
-        # FAILED summary line as one failing test (and let classify handle
-        # dedup).
-        TEST_LINE_RX='^(FAILED|PASSED) '
-        PASS_LINE_RX='^PASSED '
-        FAIL_LINE_RX='^FAILED '
-        FAIL_NAME_RX='^FAILED [^:]+::(.+)$'
-        RUN_LINE_RX='[0-9]+ (passed|failed) in '
+        # Use run summaries for counts: quiet logs omit PASSED lines and
+        # FAILED short-summary lines may repeat.
+        # Parsed below with Python to share node IDs with the classifier.
         ;;
     go)
         # go test verbose:
@@ -113,26 +108,6 @@ else
     SWIFT_EXIT=0
 fi
 
-TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
-PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
-FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
-
-# A collected log has no process status; parsed failures must still fail the
-# report. Preserve an existing non-zero status from a live test command.
-if [[ $FAILED -gt 0 && $SWIFT_EXIT -eq 0 ]]; then
-    SWIFT_EXIT=1
-fi
-
-# Pull out the failing test names for the report. macOS ships bash 3.2 (no mapfile),
-# so use a temp file and a here-string read loop.
-FAILING_TESTS_TMP="$(mktemp)"
-trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
-grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
-FAILING_TESTS=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && FAILING_TESTS+=("$line")
-done < "$FAILING_TESTS_TMP"
-
 # Classify failing tests by naming convention. Output is a small JSON file
 # that we then merge into summary.json. classify_failures.py is a sibling of
 # this script, so $SCRIPT_DIR resolves it whether installed under bin/ or
@@ -149,11 +124,140 @@ else
     echo '{"failures": [], "failures_by_class": {}, "failures_grouped": {}, "classify_error": true}' > "$CLASSIFY_FILE"
 fi
 
-# Try to extract the run-summary line. swift test may print it as either
-#   "Test run with 74 tests passed after 0.005 seconds."
-# or, when stderr is interleaved,
-#   "✔ Test run with 74 tests passed after 0.005 seconds."
-RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | tail -1 | sed -E 's/^[✔✘] //' || true)
+# macOS ships bash 3.2 (no mapfile), so pass parsed failure names through a
+# temp file and a here-string read loop.
+FAILING_TESTS_TMP="$(mktemp)"
+trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
+if [[ "$LANGUAGE" == "python" ]]; then
+    PYTEST_REPORT=$(python3 - "$LOG_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log = Path(sys.argv[1]).read_text(encoding="utf-8", errors="backslashreplace")
+lines = log.splitlines()
+headlines = re.findall(r"^_+ (.+?) _+$", log, re.MULTILINE)
+
+# Node IDs are log facts even when classification is unavailable.
+def pytest_node_id(text: str, headlines=()) -> str:
+    """Remove the assertion trailer while preserving the complete node ID."""
+    path, separator, test = text.partition("::")
+    if not separator:
+        return text.split(" - ", 1)[0]
+    # Failure headlines give the complete test name even when its parameter
+    # ID contains delimiters. Use that evidence before inspecting the trailer.
+    for headline in sorted(headlines, key=len, reverse=True):
+        if test == headline or test.startswith(headline + " - "):
+            return path + separator + headline
+    if "[" in test.split(" - ", 1)[0]:
+        # The reason begins with an assertion or exception label; a later
+        # closing bracket in arbitrary reason text does not end the node ID.
+        trailer = re.search(r"\] - (?=assert\b|[\w.]+(?::|$))", test)
+        if trailer:
+            test = test[:trailer.start() + 1]
+    else:
+        test = test.split(" - ", 1)[0]
+    return path + separator + test
+
+
+progress_rx = r"^(?:.*\.py\s+)?[.FEsxX]+(?:\s+\[\s*\d+%\])?\s*$"
+has_runner_output = any(re.match(progress_rx, line) or
+                        re.match(r"^=+ test session starts =+$", line) for line in lines)
+summary_rx = r"^[=\s]*\d+ [a-zA-Z]+(, \d+ [a-zA-Z]+)* in "
+# Progress is written before fixture teardown. Select the final summary at a
+# pytest footer boundary, ignoring later count-shaped lines without one.
+terminal_summaries = set()
+seen_summary = False
+for i in range(len(lines) - 1, -1, -1):
+    if re.match(progress_rx, lines[i]) or re.match(r"^=+ test session starts =+$", lines[i]):
+        seen_summary = False
+    previous = lines[i - 1] if i else ""
+    footer_boundary = (not previous.strip() or re.match(progress_rx, previous) or
+                       previous.startswith(("FAILED ", "PASSED ",
+                                            "-- Docs: https://docs.pytest.org/")))
+    if footer_boundary and re.match(summary_rx, lines[i]):
+        if not seen_summary:
+            terminal_summaries.add(i)
+        seen_summary = True
+last_line = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
+failing_names = {}
+passed = failed = 0
+run_passed, run_failed = set(), set()
+summaries = []
+in_details = False
+in_short_summary = False
+after_progress = False
+for i, line in enumerate(lines):
+    if re.match(progress_rx, line):
+        after_progress = True
+    if re.match(r"^=+ (test session starts|FAILURES|ERRORS) =+$", line):
+        passed += len(run_passed)
+        failed += len(run_failed)
+        run_passed.clear()
+        run_failed.clear()
+        in_details = False
+        in_short_summary = False
+        after_progress = False
+    if re.match(r"^=+ (FAILURES|ERRORS) =+$", line):
+        in_details = True
+    if re.match(r"^=+ short test summary info =+$", line):
+        in_details = False
+        in_short_summary = True
+    if line.startswith("PASSED "):
+        run_passed.add(line[7:])
+    if line.startswith("FAILED "):
+        name = pytest_node_id(line[7:], headlines)
+        run_failed.add(name)
+        failing_names.setdefault(name, None)
+    # Decoration alone is also valid test stdout. Both quiet and decorated
+    # summaries follow terminal progress, the warnings footer, or failure
+    # details. Standalone summary-only logs retain their existing fallback.
+    summary_position = not has_runner_output or (i in terminal_summaries and (
+        in_short_summary or i == last_line or after_progress or (
+        i > 0 and lines[i - 1].startswith("-- Docs: https://docs.pytest.org/"))))
+    if not in_details and summary_position and re.match(summary_rx, line):
+        counts = dict((status, int(count)) for count, status in
+                      re.findall(r"(\d+) (passed|failed)\b", line))
+        # A quiet passing run has no session banner. Retain failures from
+        # an earlier truncated run rather than discarding them here.
+        passed += max(counts.get("passed", 0), len(run_passed))
+        failed += max(counts.get("failed", 0), len(run_failed))
+        run_passed.clear()
+        run_failed.clear()
+        summaries.append(line)
+        in_short_summary = False
+        after_progress = False
+passed += len(run_passed)
+failed += len(run_failed)
+print(passed, failed)
+print("; ".join(summaries))
+for name in failing_names:
+    print(name)
+PY
+    )
+    read -r PASSED FAILED <<< "$PYTEST_REPORT"
+    TOTAL=$((PASSED + FAILED))
+    RUN_LINE=$(printf '%s\n' "$PYTEST_REPORT" | sed -n '2p')
+    printf '%s\n' "$PYTEST_REPORT" | sed -n '3,$p' > "$FAILING_TESTS_TMP"
+else
+    # Swift may prefix the run summary with a check mark.
+    RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' | tail -1 || true)
+    TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
+    PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
+    FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
+    grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
+fi
+FAILING_TESTS=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && FAILING_TESTS+=("$line")
+done < "$FAILING_TESTS_TMP"
+
+# A collected log has no process status; parsed failures must still fail the
+# report. Preserve an existing non-zero status from a live test command.
+if [[ $FAILED -gt 0 && $SWIFT_EXIT -eq 0 ]]; then
+    SWIFT_EXIT=1
+fi
+
 [[ -z "$RUN_LINE" ]] && RUN_LINE="(no summary line found)"
 
 # Write a small JSON summary. Use python3 for safe JSON encoding.
