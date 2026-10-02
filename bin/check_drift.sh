@@ -559,7 +559,7 @@ emit_awk() {
         swift)
             awk '
                 function ident(s) { n = split(s, _, "[^A-Za-z0-9_]"); return _[1] }
-                /^public[[:space:]]+(struct|class|enum|protocol)[[:space:]]+[A-Z][A-Za-z0-9_]*/ {
+                /^public[[:space:]]+(final[[:space:]]+)?(struct|class|enum|protocol)[[:space:]]+[A-Z][A-Za-z0-9_]*/ {
                     for (i = 1; i <= NF; i++) {
                         if ($i == "struct" || $i == "class" || $i == "enum" || $i == "protocol") { print ident($(i+1)); break }
                     }
