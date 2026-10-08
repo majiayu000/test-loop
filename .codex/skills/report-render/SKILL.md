@@ -38,16 +38,34 @@ Three artifacts under `docs/reports/<YYYY-MM-DD>/`:
 | File | Purpose |
 | --- | --- |
 | `log.txt` | The raw test runner output, byte-for-byte. |
-| `summary.json` | Structured facts: `total`, `passed`, `failed`, `exit_code`, `run_line`, plus the merged `failures_by_class` and `failures_grouped` when classification is available. |
-| `report.md` | A human-readable summary. Always present. Contains a `Failures by class` section only when there is at least one failure. |
+| `summary.json` | Structured facts: `total`, `passed`, `failed`, report `exit_code` (see below), `run_line`, plus the merged `failures_by_class` and `failures_grouped` when classification is available. |
+| `report.md` | A human-readable summary when rendering completes. Contains a `Failures by class` section only when there is at least one failure. |
+
+### Exit status and verdict
+
+The preview at `bin/render_report.sh` uses the same report status for its
+process exit code, `summary.json.exit_code`, and Markdown PASS/FAIL verdict:
+
+- **Live:** preserve a nonzero test-command exit code. If the command exits
+  `0` but parsed failures are present, use `1`; otherwise use `0`.
+- **Collect (`--collect`):** read the existing date-based `log.txt` without
+  running the command. Use `1` when parsed failures are present, else `0`.
+  This cannot recover the original runner exit code.
+
+These rules describe a completed render. An unsupported `--language` value
+or a missing collect log exits `2` before a new summary or report is written.
+A zero status or zero test count is not proof that tests ran or passed;
+compare the raw log and original runner result. Classification names such
+as `EXPECTED_FAILURE` do not override the report status.
 
 ## Algorithm
 
 1. **Capture** the test runner's stdout and stderr to `log.txt`. Use
    `tee` rather than `>` so the same output appears in the user's
    terminal.
-2. **Count** the number of `✔` and `✘` lines, and the test run summary
-   line. The summary line format is runner-specific; see "Runner
+2. **Count** results using the selected language's log patterns, and
+   extract the run summary. Swift uses `✔` and `✘` lines; the other
+   runners use their own result lines or summaries. See "Runner
    differences" below.
 3. **List** the failing test names, deduplicated.
 4. **Classify** if not already classified (call
@@ -59,8 +77,8 @@ Three artifacts under `docs/reports/<YYYY-MM-DD>/`:
 
 ## Runner differences
 
-The run-summary line format is the only runner-specific bit. v0.1
-recognises:
+Result extraction and run-summary formats are runner-specific. The
+working preview supports `--language swift|python|go|rust` and recognises:
 
 | Runner | Summary line shape |
 | --- | --- |
@@ -69,9 +87,11 @@ recognises:
 | go test | `ok  <package>  X.XXXs` or `FAIL` per package |
 | cargo test | `test result: ok. N passed; M failed; ...` |
 
-If the runner is not in this list, the report still renders but the
-`run_line` field in `summary.json` reads `(no summary line found)`.
-That is a deliberate fallback, not a failure.
+An unsupported `--language` value is rejected, including when a custom
+`--test-command` is supplied. For a supported language whose log has no
+recognized summary, the report still renders with `run_line` set to
+`(no summary line found)`. This fallback alone does not change the status;
+the live-command status and parsed failures still determine the verdict.
 
 ## Worked example (Swift, end-to-end)
 
