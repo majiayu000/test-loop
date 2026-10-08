@@ -23,15 +23,21 @@ The loop answers five questions:
 
 | Tool | v0.1 status | Language coverage |
 | --- | --- | --- |
-| `drift-check` skill | written | Swift (bash + awk). Other languages are documented but not yet shipped as concrete scripts. |
-| `failure-classify` skill | written | Swift Testing output. Patterns for pytest and go test are specified in the skill but the matching regex set is the user's responsibility until v0.2. |
-| `report-render` skill | written | Language-agnostic; only the run-summary line format is runner-specific. |
-| `init-loop` skill | written | Decision tree plus a copy list; concrete per-language templates arrive in v0.2. |
+| `drift-check` skill | written; script preview available | Coarse Swift, Python, Go, and Rust symbol extraction; adapt source globs and the knowledge base to the target project. |
+| `failure-classify` skill | written; script preview available | Swift Testing, pytest, go test, and cargo test log patterns; classification is based on test names. |
+| `report-render` skill | written; script preview available | Swift, Python, Go, and Rust text-log parsing, with runner-specific counts and summaries. |
+| `init-loop` skill | written | Decision tree plus a copy list; current hook and Swift/macOS CI templates require project-specific adaptation. |
 | `drill` skill | written | Procedure, not a script. |
 | `test-loop-bootstrap` skill | written | Pure routing. |
-| Underlying scripts | **not in v0.1** | The skills describe what should run; the actual scripts (bash / python) are imported in v0.2 from [caff](https://github.com/majiayu000/caff) 0.1.4. |
+| Underlying scripts | **working preview in `bin/`** | Drift checking, failure classification, and report rendering are available, alongside copyable templates and a self-check workflow. There is no polished installer. |
 
-## Why v0.1 ships skills before scripts
+Report status preserves a nonzero live command exit code and changes a zero
+status to `1` when failures are parsed. Collect mode derives `0` or `1` from
+the log and cannot recover the original command status. Zero counts or a
+PASS report do not prove tests ran; see the
+[report contract](../../.agents/skills/report-render/SKILL.md#exit-status-and-verdict).
+
+## Why v0.1 ships contracts alongside a script preview
 
 Skills are **contracts**. Scripts are **implementations**. Pinning the
 contract first means:
