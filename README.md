@@ -22,7 +22,7 @@ five points of friction and tells you which one is broken.
 | --- | --- | --- |
 | `drift-check` | a public symbol that is not in the knowledge base | pre-commit + CI |
 | `failure-classify` | a real assertion failure hiding among expected-failure tests | after `swift test` / `pytest` / `go test` |
-| `report-render` | a passing suite whose report is unparseable | after every test run |
+| `report-render` | test-log counts, failures, and report status (subject to text-parser limits) | after every test run |
 | `init-loop` | a project that does not have the loop at all | once per project |
 | `drill` | a loop that exists but does not actually react | once after install |
 
@@ -107,15 +107,31 @@ and the [report skill contract](.agents/skills/report-render/SKILL.md).
 No. Classification uses the **test name**, not its body or assertion result.
 `EXPECTED_FAILURE` describes a test intended to verify rejection; a runner
 failure in that test can mean the rejection contract is broken. It is not
-pytest's `xfail` status and does not turn a red suite green. The renderer returns
-the underlying test command's exit code. Read the raw failure before deciding
-what to fix, and use the [failure-classification skill](.agents/skills/failure-classify/SKILL.md)
+pytest's `xfail` status and does not turn a red suite green. Read the raw failure
+before deciding what to fix, and use the
+[failure-classification skill](.agents/skills/failure-classify/SKILL.md)
 and [taxonomy](templates/knowledge/L2_equivalence_classes.md).
 
+### How is the report exit status determined?
+
+When rendering completes, the same status drives the script's exit code,
+`summary.json.exit_code`, and the Markdown PASS/FAIL verdict:
+
+- A live run preserves any nonzero exit code from the test command, even if
+  the log contains no recognized failures.
+- If the test command exits zero but the parser finds failed tests, the
+  report status becomes `1`. Otherwise it remains `0`.
+- `--collect` starts from `0` and sets the report status to `1` when the
+  parser finds failed tests.
+
 `--collect` only renders the existing date-based `log.txt`; it does not rerun
-tests and sets the command exit code to zero. Do not use a collect-only exit as
-proof that the original test command succeeded. The generated report is an
-inspection aid; retain the original runner result as the CI gate.
+tests or recover the original command's exit status. A collect-only `0` means
+no failures were recognized, not that the original command succeeded or that
+tests ran. Retain the original runner result alongside the report for CI.
+
+Unsupported `--language` values and a missing collect log exit `2` before
+rendering. With a supported language, an unrecognized summary instead uses
+`(no summary line found)`; that fallback alone does not make the report fail.
 
 ## Relationship to other projects
 
