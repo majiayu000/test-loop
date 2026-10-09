@@ -85,6 +85,10 @@ bash bin/render_report.sh --language go --test-command 'go test -v ./...'
 bash bin/render_report.sh --language rust --test-command 'cargo test --no-fail-fast'
 ```
 
+The parsers ignore ANSI SGR color/style sequences and accept LF or CRLF
+line endings. Reports use the plain-text view; `log.txt` keeps the original
+bytes. This does not interpret terminal cursor movement or other log formats.
+
 The default language is Swift and the default command is
 `swift test --parallel`. The checked-in [CI template](templates/github/test.yml)
 is a Swift/macOS starting point: adapt its runner, build command, and report

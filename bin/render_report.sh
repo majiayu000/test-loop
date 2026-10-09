@@ -108,13 +108,28 @@ else
     SWIFT_EXIT=0
 fi
 
+# Parse a temporary view: terminal colors and CRLF are presentation, while
+# log.txt remains the original byte-for-byte evidence (also in collect mode).
+PARSE_LOG="$(mktemp)"
+FAILING_TESTS_TMP=""
+trap 'rm -f "$PARSE_LOG" "$FAILING_TESTS_TMP"' EXIT
+python3 - "$LOG_FILE" "$PARSE_LOG" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+plain = re.sub(rb"\x1b\[[0-9;:]*m", b"", raw).replace(b"\r\n", b"\n")
+Path(sys.argv[2]).write_bytes(plain)
+PY
+
 # Classify failing tests by naming convention. Output is a small JSON file
 # that we then merge into summary.json. classify_failures.py is a sibling of
 # this script, so $SCRIPT_DIR resolves it whether installed under bin/ or
 # scripts/.
 CLASSIFY_FILE="$REPORT_DIR/classify.json"
 CLASSIFY_ERR="$REPORT_DIR/classify.err"
-if python3 "$SCRIPT_DIR/classify_failures.py" --language "$LANGUAGE" --in "$LOG_FILE" --out "$CLASSIFY_FILE" 2>"$CLASSIFY_ERR"; then
+if python3 "$SCRIPT_DIR/classify_failures.py" --language "$LANGUAGE" --in "$PARSE_LOG" --out "$CLASSIFY_FILE" 2>"$CLASSIFY_ERR"; then
     rm -f "$CLASSIFY_ERR"
 else
     # Do not hide the failure behind an empty {} (no silent degradation):
@@ -127,9 +142,8 @@ fi
 # macOS ships bash 3.2 (no mapfile), so pass parsed failure names through a
 # temp file and a here-string read loop.
 FAILING_TESTS_TMP="$(mktemp)"
-trap 'rm -f "$FAILING_TESTS_TMP"' EXIT
 if [[ "$LANGUAGE" == "python" ]]; then
-    PYTEST_REPORT=$(python3 - "$LOG_FILE" <<'PY'
+    PYTEST_REPORT=$(python3 - "$PARSE_LOG" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -241,11 +255,11 @@ PY
     printf '%s\n' "$PYTEST_REPORT" | sed -n '3,$p' > "$FAILING_TESTS_TMP"
 else
     # Swift may prefix the run summary with a check mark.
-    RUN_LINE=$(grep -E "$RUN_LINE_RX" "$LOG_FILE" | sed -E 's/^[✔✘] //' | tail -1 || true)
-    TOTAL=$(grep -cE "$TEST_LINE_RX" "$LOG_FILE" || true)
-    PASSED=$(grep -cE "$PASS_LINE_RX" "$LOG_FILE" || true)
-    FAILED=$(grep -cE "$FAIL_LINE_RX" "$LOG_FILE" || true)
-    grep -E "$FAIL_LINE_RX" "$LOG_FILE" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
+    RUN_LINE=$(grep -E "$RUN_LINE_RX" "$PARSE_LOG" | sed -E 's/^[✔✘] //' | tail -1 || true)
+    TOTAL=$(grep -cE "$TEST_LINE_RX" "$PARSE_LOG" || true)
+    PASSED=$(grep -cE "$PASS_LINE_RX" "$PARSE_LOG" || true)
+    FAILED=$(grep -cE "$FAIL_LINE_RX" "$PARSE_LOG" || true)
+    grep -E "$FAIL_LINE_RX" "$PARSE_LOG" | sed -E "s/${FAIL_NAME_RX}/\1/" > "$FAILING_TESTS_TMP" || true
 fi
 FAILING_TESTS=()
 while IFS= read -r line; do
