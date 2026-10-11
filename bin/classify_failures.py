@@ -149,6 +149,11 @@ DEFAULT_CLASS = "ASSERTION_FAILURE"
 FALLBACK_CLASS = "UNKNOWN"
 
 
+def normalize_log_text(log_text: str) -> str:
+    """Ignore terminal SGR styling and CRLF when interpreting runner text."""
+    return re.sub(r"\x1b\[[0-9;:]*m", "", log_text).replace("\r\n", "\n")
+
+
 def detect_language(log_text: str) -> str:
     """Sniff log_text against EXTRACT_PATTERNS and return the winning language.
 
@@ -158,6 +163,7 @@ def detect_language(log_text: str) -> str:
 
     Raises ValueError when no pattern matches any line.
     """
+    log_text = normalize_log_text(log_text)
     scores: dict[str, int] = {
         lang: sum(1 for _ in rx.finditer(log_text))
         for lang, rx in EXTRACT_PATTERNS.items()
@@ -215,6 +221,7 @@ def extract_failing_names(log_text: str, language: str = "swift") -> list[str]:
     The line shape depends on the runner; see EXTRACT_PATTERNS.
     Pass ``language="auto"`` to sniff the log and pick a runner first.
     """
+    log_text = normalize_log_text(log_text)
     language = resolve_language(log_text, language)
     rx = EXTRACT_PATTERNS[language]
     headlines = re.findall(r"^_+ (.+?) _+$", log_text, re.MULTILINE) if language == "python" else []
@@ -307,6 +314,27 @@ def main(argv: list[str]) -> int:
 
 
 class TestClassifier(unittest.TestCase):
+    def test_terminal_styling_and_crlf(self) -> None:
+        cases = {
+            "swift": ("✘ Test example() failed after 0.001 seconds.\n", ["example"]),
+            "python": ("FAILED test_sample.py::test_answer - assert 4 == 5\n", ["test_sample.py::test_answer"]),
+            "go": ("--- FAIL: TestHelloName (0.00s)\n", ["TestHelloName"]),
+            "rust": ("test tests::another ... FAILED\n", ["tests::another"]),
+        }
+        for language, (plain, names) in cases.items():
+            for styled in (plain, "\x1b[31m" + plain.rstrip("\n") + "\x1b[0m\n"):
+                for text in (styled, styled.replace("\n", "\r\n")):
+                    with self.subTest(language=language, text=text):
+                        self.assertEqual(detect_language(text), language)
+                        self.assertEqual(extract_failing_names(text, language), names)
+                        self.assertEqual(extract_failing_names(text, "auto"), names)
+
+    def test_styled_pytest_headline_preserves_parameter_id(self) -> None:
+        text = ("\x1b[1m____ test_value[a] - b] ____\x1b[0m\r\n"
+                "\x1b[31mFAILED\x1b[0m test_sample.py::test_value[a] - b] - assert False\r\n")
+        self.assertEqual(extract_failing_names(text, "python"),
+                         ["test_sample.py::test_value[a] - b]"])
+
     def test_extracts_names(self) -> None:
         log = """
 ✔ Test a() passed after 0.001 seconds.
