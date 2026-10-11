@@ -88,7 +88,7 @@ case "$LANGUAGE" in
         TEST_LINE_RX='^test[[:space:]]+\S+[[:space:]]+\.\.\. '
         PASS_LINE_RX='^test[[:space:]]+\S+[[:space:]]+\.\.\. ok'
         FAIL_LINE_RX='^test[[:space:]]+\S+[[:space:]]+\.\.\. FAILED'
-        FAIL_NAME_RX='^test[[:space:]]+(\S+)[[:space:]]+\.\.\. FAILED'
+        FAIL_NAME_RX='^test[[:space:]]+([^[:space:]]+)[[:space:]]+\.\.\. FAILED'
         RUN_LINE_RX='test result: (ok|FAILED)\.'
         ;;
     *) echo "unsupported --language: $LANGUAGE" >&2; exit 2 ;;
